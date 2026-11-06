@@ -1,6 +1,9 @@
 //! utop — a lightweight htop clone. Thin binary entry point.
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let config = utop::cli::parse();
-    utop::run(&config)
+    if let Err(err) = utop::run(&config) {
+        eprintln!("utop: {err}");
+        std::process::exit(1);
+    }
 }

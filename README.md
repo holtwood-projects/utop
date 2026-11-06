@@ -27,6 +27,32 @@ A lightweight terminal process monitor written in Rust, based on ratatui and sys
 - Mouse wheel scrolling
 - Command-line options: initial sort, filter, refresh interval, view mode
 
+## Ascend NPU mode
+
+When `npu-smi` is available, utop opens on the NPU screen:
+
+- Per-card health, temperature, power, AI Core utilisation and HBM usage
+- Chip details: PCIe bus id, HBM used/total, hugepages
+- NPU process table aggregated by PID: a process spanning several cards
+  appears once, with every card id listed
+- `F2` switches between the NPU and system views; `Tab` moves focus
+  between the card table and the process table
+
+One limit is worth stating up front: `npu-smi` and DCMI expose **card-level**
+AI Core utilisation and **process-level** HBM usage, but not per-process
+compute usage. The `NPU` column in the process table therefore describes
+reserved HBM and card placement, not a per-process utilisation percentage.
+
+For scripts and CI:
+
+```sh
+utop --once          # one text sample
+utop --once --json   # one JSON sample
+```
+
+The NPU collector runs on a background thread with a deadline on every
+`npu-smi` call, so a slow or hung driver cannot freeze the TUI.
+
 ## Build & Run
 
 ```sh
@@ -52,6 +78,8 @@ utop [选项]
   -d, --delay <MS>     刷新间隔（毫秒），范围 100..=5000 [默认：500]
   -f, --filter <STR>   初始进程过滤（匹配名称或 PID）
   -t, --tree           以树状视图启动
+      --once           输出一次 NPU 采样后退出
+  -j, --json           配合 --once，输出 JSON 而非表格
   -V, --version        打印版本并退出
 ```
 
@@ -72,6 +100,8 @@ utop [选项]
 | k | Kill the selected process (y = SIGTERM, K = SIGKILL, Esc = cancel) |
 | d / Enter | Toggle process details |
 | - / + | Decrease / increase the refresh interval (step 100 ms) |
+| Tab | Switch card / process focus (NPU view) |
+| F2 | Switch between the NPU and system views |
 
 Note: when filtering, the tree view is temporarily flattened into a list, because a broken tree is harder to read than a plain list.
 
@@ -87,6 +117,9 @@ Note: when filtering, the tree view is temporarily flattened into a list, becaus
 | `src/collect.rs` | sysinfo snapshots (the only module that touches sysinfo) |
 | `src/ui.rs` | ratatui rendering (pure rendering, reads only the snapshot in App) |
 | `src/cli.rs` | Command-line argument parsing (pure parser) |
+| `src/npu/model.rs` | NPU card / process model, aggregation (pure) |
+| `src/npu/smi.rs` | `npu-smi` invocation and text parsing (only subprocess site) |
+| `src/npu/collect.rs` | Background collector thread with latest-wins delivery |
 
 The layering is strictly acyclic: `model` ← `cli` ← `app` ← {`collect`, `ui`} ← `run`. Everything except `run` and `collect` is pure logic, so unit tests need no real system.
 
@@ -132,6 +165,29 @@ Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), and 
 - 鼠标滚轮滚动
 - 命令行参数：初始排序、过滤、刷新间隔、视图模式
 
+## 昇腾 NPU 模式
+
+检测到 `npu-smi` 时，utop 默认进入 NPU 视图：
+
+- 逐卡显示健康状态、温度、功耗、AI Core 利用率与 HBM 占用
+- 芯片详情：PCIe 总线号、HBM 已用/总量、大页使用
+- NPU 进程表按 PID 聚合：跨多卡的进程只出现一次，NPU 列列出全部卡号
+- `F2` 在 NPU 视图与系统视图之间切换；`Tab` 在卡表与进程表之间切换焦点
+
+有一个边界需要提前说明：`npu-smi` 和 DCMI 提供**卡级** AI Core 利用率与
+**进程级** HBM 占用，但不提供进程级算力利用率。因此进程表的 `NPU` 列表示
+显存占用与卡归属，而不是单进程利用率。
+
+脚本与 CI 用法：
+
+```sh
+utop --once          # 输出一次文本采样
+utop --once --json   # 输出一次 JSON 采样
+```
+
+NPU 采集运行在后台线程，每次 `npu-smi` 调用都有超时；驱动变慢或卡死不会
+冻结 TUI。
+
 ## 构建与运行
 
 ```sh
@@ -157,6 +213,8 @@ utop [选项]
   -d, --delay <MS>     刷新间隔（毫秒），范围 100..=5000 [默认：500]
   -f, --filter <STR>   初始进程过滤（匹配名称或 PID）
   -t, --tree           以树状视图启动
+      --once           输出一次 NPU 采样后退出
+  -j, --json           配合 --once，输出 JSON 而非表格
   -V, --version        打印版本并退出
 ```
 
@@ -177,6 +235,8 @@ utop [选项]
 | k | 杀死选中进程（y = SIGTERM，K = SIGKILL，Esc = 取消） |
 | d / 回车 | 切换进程详情 |
 | - / + | 减小 / 增大刷新间隔（步长 100 毫秒） |
+| Tab | 切换卡表 / 进程表焦点（NPU 视图） |
+| F2 | 切换 NPU / 系统视图 |
 
 注：过滤时会临时把树状视图拍平为列表，因为残缺的树比普通列表更难读。
 
@@ -192,6 +252,9 @@ utop [选项]
 | `src/collect.rs` | sysinfo 快照（唯一碰 sysinfo 的模块） |
 | `src/ui.rs` | ratatui 渲染（纯渲染，只读 App 中的快照） |
 | `src/cli.rs` | 命令行参数解析（纯解析器） |
+| `src/npu/model.rs` | NPU 卡 / 进程模型与聚合（纯逻辑） |
+| `src/npu/smi.rs` | `npu-smi` 调用与文本解析（唯一子进程入口） |
+| `src/npu/collect.rs` | 后台采集线程，latest-wins 投递 |
 
 分层严格无环：`model` ← `cli` ← `app` ← {`collect`, `ui`} ← `run`。除 `run` 与 `collect` 外全部是纯逻辑，单元测试无需真实系统。
 

@@ -13,12 +13,30 @@ use crate::cli::{Config, MAX_DELAY_MS, MIN_DELAY_MS};
 use crate::model::{
     Pid, ProcDetails, ProcRow, SignalKind, SortKey, SysStats, resolve_selected_index, sort_rows,
 };
+use crate::npu::model::{NpuCard, NpuProcRow, NpuSnapshot, filter_proc_rows, sort_proc_rows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputMode {
     Normal,
     Searching,
     ConfirmKill,
+}
+
+/// Top-level screen. The NPU view is selected automatically when
+/// `npu-smi` is available; the system view keeps the original process UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum View {
+    #[default]
+    System,
+    Npu,
+}
+
+/// Which NPU pane owns arrow-key navigation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NpuFocus {
+    #[default]
+    Cards,
+    Procs,
 }
 
 /// Number of ticks a status message stays visible before being cleared.
@@ -36,6 +54,15 @@ pub(crate) enum Followup {
     Rebuild,
     /// Take fresh samples and rebuild everything.
     Refresh,
+}
+
+/// Advances an index by `step`, clamping to `len - 1`.
+fn clamp_index(current: usize, step: usize, len: usize) -> usize {
+    if current + step < len {
+        current + step
+    } else {
+        len.saturating_sub(1)
+    }
 }
 
 pub(crate) struct App {
@@ -64,6 +91,19 @@ pub(crate) struct App {
     pub(crate) details: Option<ProcDetails>,
     /// Collection work requested by the last input handler.
     pub(crate) followup: Followup,
+
+    // -- NPU view state ---------------------------------------------------
+    pub(crate) view: View,
+    pub(crate) npu: NpuSnapshot,
+    /// Aggregated processes before the current filter is applied.
+    pub(crate) npu_all_procs: Vec<NpuProcRow>,
+    /// Filtered, sorted rows the UI renders and `k` acts on.
+    pub(crate) npu_procs: Vec<NpuProcRow>,
+    pub(crate) npu_card_selected: usize,
+    pub(crate) npu_selected: usize,
+    pub(crate) npu_focus: NpuFocus,
+    /// HBM sort direction for the NPU process pane.
+    pub(crate) npu_desc: bool,
 }
 
 impl App {
@@ -87,6 +127,14 @@ impl App {
             stats: SysStats::default(),
             details: None,
             followup: Followup::None,
+            view: View::System,
+            npu: NpuSnapshot::default(),
+            npu_all_procs: Vec::new(),
+            npu_procs: Vec::new(),
+            npu_card_selected: 0,
+            npu_selected: 0,
+            npu_focus: NpuFocus::Cards,
+            npu_desc: true,
         }
     }
 
@@ -174,23 +222,105 @@ impl App {
     // -- selection ---------------------------------------------------------
 
     pub(crate) fn move_up(&mut self, step: usize) {
-        self.selected = self.selected.saturating_sub(step);
+        match self.view {
+            View::Npu => match self.npu_focus {
+                NpuFocus::Cards => {
+                    self.npu_card_selected = self.npu_card_selected.saturating_sub(step);
+                }
+                NpuFocus::Procs => {
+                    self.npu_selected = self.npu_selected.saturating_sub(step);
+                }
+            },
+            View::System => self.selected = self.selected.saturating_sub(step),
+        }
     }
 
     pub(crate) fn move_down(&mut self, step: usize) {
-        if self.selected + step < self.processes.len() {
-            self.selected += step;
-        } else {
-            self.selected = self.processes.len().saturating_sub(1);
+        match self.view {
+            View::Npu => match self.npu_focus {
+                NpuFocus::Cards => {
+                    self.npu_card_selected =
+                        clamp_index(self.npu_card_selected, step, self.npu.cards.len());
+                }
+                NpuFocus::Procs => {
+                    self.npu_selected = clamp_index(self.npu_selected, step, self.npu_procs.len());
+                }
+            },
+            View::System => {
+                self.selected = clamp_index(self.selected, step, self.processes.len());
+            }
         }
     }
 
     pub(crate) fn select_first(&mut self) {
-        self.selected = 0;
+        match self.view {
+            View::Npu => match self.npu_focus {
+                NpuFocus::Cards => self.npu_card_selected = 0,
+                NpuFocus::Procs => self.npu_selected = 0,
+            },
+            View::System => self.selected = 0,
+        }
     }
 
     pub(crate) fn select_last(&mut self) {
-        self.selected = self.processes.len().saturating_sub(1);
+        match self.view {
+            View::Npu => match self.npu_focus {
+                NpuFocus::Cards => self.npu_card_selected = self.npu.cards.len().saturating_sub(1),
+                NpuFocus::Procs => self.npu_selected = self.npu_procs.len().saturating_sub(1),
+            },
+            View::System => self.selected = self.processes.len().saturating_sub(1),
+        }
+    }
+
+    // -- NPU view ----------------------------------------------------------
+
+    pub(crate) fn toggle_view(&mut self) {
+        self.view = match self.view {
+            View::Npu => View::System,
+            View::System => View::Npu,
+        };
+    }
+
+    pub(crate) fn toggle_npu_focus(&mut self) {
+        self.npu_focus = match self.npu_focus {
+            NpuFocus::Cards => NpuFocus::Procs,
+            NpuFocus::Procs => NpuFocus::Cards,
+        };
+    }
+
+    pub(crate) fn toggle_npu_desc(&mut self) {
+        self.npu_desc = !self.npu_desc;
+        sort_proc_rows(&mut self.npu_all_procs, self.npu_desc);
+        self.reshape_npu_procs();
+    }
+
+    /// Installs one sample. A failed sample keeps the last good card list so
+    /// a transient driver hiccup does not blank the screen.
+    pub(crate) fn apply_npu(&mut self, snapshot: NpuSnapshot) {
+        if snapshot.cards.is_empty() && snapshot.error.is_some() && !self.npu.cards.is_empty() {
+            self.npu.error = snapshot.error;
+            return;
+        }
+        self.npu = snapshot;
+        self.npu_all_procs = self.npu.aggregate_processes();
+        sort_proc_rows(&mut self.npu_all_procs, self.npu_desc);
+        self.reshape_npu_procs();
+        if self.npu_card_selected >= self.npu.cards.len() {
+            self.npu_card_selected = self.npu.cards.len().saturating_sub(1);
+        }
+    }
+
+    /// Re-applies the shared filter to the NPU process list. Cheap enough to
+    /// run after every input that can change the filter.
+    pub(crate) fn reshape_npu_procs(&mut self) {
+        self.npu_procs = filter_proc_rows(&self.npu_all_procs, &self.filter);
+        if self.npu_selected >= self.npu_procs.len() {
+            self.npu_selected = self.npu_procs.len().saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn selected_card(&self) -> Option<&NpuCard> {
+        self.npu.cards.get(self.npu_card_selected)
     }
 
     // -- filter (search mode) ---------------------------------------------
@@ -216,9 +346,18 @@ impl App {
     /// Starts the kill confirmation for the selected process. Returns the
     /// PID and name so the caller can show a status prompt.
     pub(crate) fn begin_kill_selected(&mut self) -> Option<(Pid, String)> {
-        let row = self.processes.get(self.selected)?;
-        let pid = row.pid;
-        let name = row.name.clone();
+        let (pid, name) = match (self.view, self.npu_focus) {
+            (View::Npu, NpuFocus::Procs) => {
+                let row = self.npu_procs.get(self.npu_selected)?;
+                (Pid::from_u32(row.pid), row.name.clone())
+            }
+            // Killing a card makes no sense; require the process pane.
+            (View::Npu, NpuFocus::Cards) => return None,
+            (View::System, _) => {
+                let row = self.processes.get(self.selected)?;
+                (row.pid, row.name.clone())
+            }
+        };
         self.kill_target = Some(pid);
         self.mode = InputMode::ConfirmKill;
         Some((pid, name))

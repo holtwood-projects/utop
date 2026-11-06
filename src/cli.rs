@@ -9,6 +9,10 @@ pub struct Config {
     pub delay_ms: u64,
     pub filter: String,
     pub tree: bool,
+    /// Print one NPU sample and exit instead of starting the TUI.
+    pub once: bool,
+    /// With `--once`, emit JSON instead of a table.
+    pub json: bool,
 }
 
 /// Outcome of argument parsing: run with a config, print help, or print
@@ -33,6 +37,8 @@ impl Default for Config {
             delay_ms: 500,
             filter: String::new(),
             tree: false,
+            once: false,
+            json: false,
         }
     }
 }
@@ -50,6 +56,8 @@ Options:
                        [default: 500]
   -f, --filter <STR>   Initial process filter (matches name or PID)
   -t, --tree           Start in tree view
+      --once           Print one NPU sample and exit
+  -j, --json           With --once, print JSON instead of a table
   -V, --version        Print version and exit
 ";
 
@@ -102,8 +110,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Action, Str
                 config.filter = args.next().ok_or("--filter requires a value")?;
             }
             "-t" | "--tree" => config.tree = true,
+            "--once" => config.once = true,
+            "-j" | "--json" => config.json = true,
             other => return Err(format!("unknown argument '{other}'")),
         }
+    }
+    if config.json && !config.once {
+        return Err("--json requires --once".to_string());
     }
     Ok(Action::Run(config))
 }
@@ -146,6 +159,18 @@ mod tests {
         let config = cfg(&["-f", "rust", "-t"]);
         assert_eq!(config.filter, "rust");
         assert!(config.tree);
+    }
+
+    #[test]
+    fn once_and_json_flags() {
+        let config = cfg(&["--once", "--json"]);
+        assert!(config.once);
+        assert!(config.json);
+    }
+
+    #[test]
+    fn json_without_once_is_an_error() {
+        assert!(parse_args(args(&["--json"])).is_err());
     }
 
     #[test]

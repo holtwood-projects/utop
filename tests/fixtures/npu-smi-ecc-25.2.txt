@@ -1,0 +1,14 @@
+===TYPE:ecc===
+	NPU ID                                   : 7
+	Chip Count                               : 1
+
+	HBM Single Bit Error Count               : 0
+	HBM Double Bit Error Count               : 0
+	HBM Single Bit Aggregate Total Err Cnt   : 0
+	HBM Double Bit Aggregate Total Err Cnt   : 0
+	HBM Single Bit Isolated Pages Count      : 0
+	HBM Double Bit Isolated Pages Count      : 0
+	HBM Single Bit Next-Isolated Pages Count : 0
+	HBM Double Bit Next-Isolated Pages Count : 0
+	Chip ID                                  : 0
+

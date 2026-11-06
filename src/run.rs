@@ -20,10 +20,11 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, widgets::TableState};
 
-use crate::app::{App, Followup, InputMode};
+use crate::app::{App, Followup, InputMode, View};
 use crate::cli::Config;
 use crate::collect::{self, KillOutcome, System};
 use crate::model::{SignalKind, build_tree, resolve_selected_index, selected_pid};
+use crate::npu::collect::NpuFeed;
 use crate::ui::ui;
 
 /// Lines moved per mouse-wheel scroll tick.
@@ -47,6 +48,10 @@ enum Flow {
 pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     install_panic_hook();
     let mut sys = collect::init_system();
+    // One probe before taking over the terminal: it decides the initial
+    // view and keeps the no-NPU case on the original process screen.
+    let npu_feed = crate::npu::smi::available()
+        .then(|| NpuFeed::spawn(Duration::from_millis(config.delay_ms.max(1000))));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -54,7 +59,7 @@ pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, config, &mut sys);
+    let res = event_loop(&mut terminal, config, &mut sys, npu_feed);
 
     restore_terminal();
     res
@@ -82,14 +87,29 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &Config,
     sys: &mut System,
+    npu_feed: Option<NpuFeed>,
 ) -> Result<(), Box<dyn Error>> {
     let mut app = App::new(config);
+    if npu_feed.is_some() {
+        app.view = View::Npu;
+    } else {
+        app.set_status("npu-smi not found; showing system view".to_string());
+    }
     collect::sync_app(sys, &mut app);
 
     let mut last_tick = Instant::now();
     let mut table_state = TableState::default();
 
     loop {
+        // NPU samples arrive asynchronously; drain them every frame so a
+        // slow tick rate does not delay the whole screen.
+        if !app.paused
+            && let Some(feed) = &npu_feed
+            && let Some(snapshot) = feed.poll()
+        {
+            app.apply_npu(snapshot);
+        }
+
         let tick_rate = Duration::from_millis(app.tick_rate_ms);
         if last_tick.elapsed() >= tick_rate {
             if !app.paused {
@@ -109,7 +129,14 @@ fn event_loop(
         collect::update_details(sys, &mut app);
         terminal.draw(|f| ui(f, &app, &mut table_state))?;
 
+        // With an NPU feed, cap the event wait so samples are picked up
+        // between ticks. Without one, keep the original idle behaviour.
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+        let timeout = if npu_feed.is_some() {
+            timeout.min(Duration::from_millis(100))
+        } else {
+            timeout
+        };
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
@@ -151,6 +178,9 @@ fn on_key(sys: &mut System, app: &mut App, key: KeyEvent) -> Flow {
 /// Performs the collection work requested by input handlers and executes an
 /// armed kill. The only place outside `collect` that drives collection.
 fn settle(sys: &mut System, app: &mut App) {
+    // The filter is shared by both views, so re-apply it to NPU rows after
+    // every input that may have changed it.
+    app.reshape_npu_procs();
     match app.take_followup() {
         Followup::None => {}
         Followup::Reshape => resort(app),
@@ -212,13 +242,27 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> Flow {
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
         KeyCode::Char('s') => {
-            app.cycle_sort();
-            app.request(Followup::Reshape);
+            if app.view == View::Npu {
+                app.toggle_npu_desc();
+            } else {
+                app.cycle_sort();
+                app.request(Followup::Reshape);
+            }
         }
         KeyCode::Char('r') => {
-            app.toggle_desc();
-            app.request(Followup::Reshape);
+            if app.view == View::Npu {
+                app.toggle_npu_desc();
+            } else {
+                app.toggle_desc();
+                app.request(Followup::Reshape);
+            }
         }
+        KeyCode::Tab => {
+            if app.view == View::Npu {
+                app.toggle_npu_focus();
+            }
+        }
+        KeyCode::F(2) => app.toggle_view(),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('p') => app.toggle_paused(),
         KeyCode::Char('t') => {

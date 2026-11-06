@@ -8,11 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ascend NPU view (`F2`), sampling `npu-smi info` on a background thread:
+  per-card health, temperature, power, AI Core utilisation and HBM usage,
+  plus the NPU process table aggregated by PID. `Tab` switches focus
+  between the card table and the process table.
+- `--once` / `--json` for scriptable one-shot NPU samples.
+- Fixture-based parser tests (`tests/fixtures/`, `tests/npu_parse.rs`), so
+  the text layer is covered on CI machines without an NPU.
+- `npu` module: pure card/process model, `npu-smi` parser with a deadline
+  on every subprocess, and a latest-wins collector thread.
 - Crate is now a library plus a thin binary, so integration tests can link
   against the public API (`tests/api.rs`).
 
 ### Changed
 
+- The default view is the NPU screen when `npu-smi` is present; without it
+  utop falls back to the original system view.
 - The module boundary is now real instead of aspirational: `collect` is
   literally the only module that imports sysinfo. The UI reads snapshot
   structs (`SysStats` / `ProcDetails`) stored on `App`, the event loop
@@ -32,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `npu-smi` 25.x writes HBM usage as `57636/ 65536` without a space before
+  the slash; this used to parse as zero. Both the spaced (24.x) and tight
+  (25.x) forms are now accepted.
+- ECC isolated-page counters use `HBM Single/Double Bit Isolated Pages
+  Count` on 25.x; the parser now matches those keys as well.
+- `npu-smi` is spawned with the common Ascend driver library directories
+  when `LD_LIBRARY_PATH` is unset, covering containers where the tool is
+  not registered with `ldconfig` (observed on a real 910B2 host).
 - The `Cmd` line in the details panel was always empty: process command
   lines were never sampled.
 - Details panel memory was labelled "MB" for MiB values; now "MiB".

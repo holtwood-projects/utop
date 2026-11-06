@@ -11,10 +11,18 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, NpuFocus, View};
 use crate::model::{ProcRow, SortKey, SysStats, display_name};
+use crate::npu::model::{Health, NpuCard};
 
 pub(crate) fn ui(frame: &mut ratatui::Frame<'_>, app: &App, table_state: &mut TableState) {
+    match app.view {
+        View::Npu => ui_npu(frame, app),
+        View::System => ui_system(frame, app, table_state),
+    }
+}
+
+fn ui_system(frame: &mut ratatui::Frame<'_>, app: &App, table_state: &mut TableState) {
     let summary = summary_content(app);
     // +2 for the block borders.
     let summary_height = summary.len() as u16 + 2;
@@ -328,6 +336,267 @@ fn draw_process_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
+// -- NPU view ------------------------------------------------------------
+
+fn ui_npu(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let card_rows = app.npu.cards.len().clamp(1, 8) as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(card_rows + 2),
+            Constraint::Length(6),
+            Constraint::Min(5),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(npu_header_lines(app))
+        .block(Block::default().borders(Borders::ALL).title("utop-npu"));
+    frame.render_widget(header, chunks[0]);
+    draw_npu_cards(frame, chunks[1], app);
+    draw_npu_details(frame, chunks[2], app);
+    draw_npu_procs(frame, chunks[3], app);
+}
+
+fn npu_header_lines(app: &App) -> Vec<Line<'static>> {
+    let npu = &app.npu;
+    let driver = if npu.driver_version.is_empty() {
+        "-"
+    } else {
+        &npu.driver_version
+    };
+    let tool = if npu.tool_version.is_empty() {
+        "-"
+    } else {
+        &npu.tool_version
+    };
+    let mut first = vec![
+        Span::styled(
+            " utop-npu ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("driver {driver}  npu-smi {tool}  ")),
+        Span::raw(if npu.collected_at.is_none() && npu.error.is_none() {
+            format!("sampling...  {:.1}s", app.tick_rate_ms as f64 / 1000.0)
+        } else {
+            format!(
+                "{} device(s)  {:.1}s",
+                npu.cards.len(),
+                app.tick_rate_ms as f64 / 1000.0
+            )
+        }),
+    ];
+    if app.paused {
+        first.push(Span::styled(
+            "  PAUSED",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(error) = &npu.error {
+        first.push(Span::styled(
+            format!("  {error}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    let focus = match app.npu_focus {
+        NpuFocus::Cards => "CARDS",
+        NpuFocus::Procs => "PROCS",
+    };
+    let order = if app.npu_desc { "HBM desc" } else { "HBM asc" };
+    let filter = if app.filter.is_empty() {
+        "-".to_string()
+    } else {
+        app.filter.clone()
+    };
+    let mut second = vec![
+        Span::raw(format!("Focus {focus}  Sort {order}  Filter {filter}  ")),
+        Span::raw("Tab focus | F2 system | s sort | / filter | p pause | k kill | q quit"),
+    ];
+    if !app.status.is_empty() {
+        second.push(Span::styled(
+            format!("  {}", app.status),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    vec![Line::from(first), Line::from(second)]
+}
+
+fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let header = Row::new(["NPU", "NAME", "HEALTH", "TEMP", "POWER", "AICORE", "HBM"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = app.npu.cards.iter().map(card_row);
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Min(18),
+    ];
+    let mut state = TableState::default();
+    state.select((!app.npu.cards.is_empty()).then_some(app.npu_card_selected));
+    let title = if app.npu_focus == NpuFocus::Cards {
+        format!("NPU devices * ({})", app.npu.cards.len())
+    } else {
+        format!("NPU devices ({})", app.npu.cards.len())
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol("\u{25b6} ");
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn card_row(card: &NpuCard) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(card.index.to_string()),
+        Cell::from(card.name.clone()),
+        Cell::from(Span::styled(card.health.label(), health_style(card.health))),
+        Cell::from(Span::styled(
+            format!("{:.0}C", card.temp_c),
+            Style::default().fg(temp_color(card.temp_c)),
+        )),
+        Cell::from(format!("{:.0}W", card.power_w)),
+        Cell::from(Span::styled(
+            format!("{:.0}%", card.aicore_pct),
+            Style::default().fg(util_color(card.aicore_pct)),
+        )),
+        Cell::from(Span::styled(
+            format!(
+                "{:.1}/{:.0}G",
+                card.hbm_used_mb as f64 / 1024.0,
+                card.hbm_total_mb as f64 / 1024.0
+            ),
+            Style::default().fg(hbm_color(card.hbm_pct())),
+        )),
+    ])
+}
+
+fn draw_npu_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let lines = match app.selected_card() {
+        Some(card) => vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" NPU {}  ", card.index),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{}  ", card.name)),
+                Span::styled(card.health.label().to_string(), health_style(card.health)),
+                Span::raw(format!(
+                    "  {:.0}C  {:.1}W  AICore {:.0}%",
+                    card.temp_c, card.power_w, card.aicore_pct
+                )),
+            ]),
+            Line::from(format!(
+                " Bus {}  HBM {}/{} MB ({:.1}%)  Hugepages {}/{}",
+                card.bus_id,
+                card.hbm_used_mb,
+                card.hbm_total_mb,
+                card.hbm_pct(),
+                card.hugepages_used,
+                card.hugepages_total
+            )),
+            Line::from(format!(
+                " DDR {}/{} MB  |  AIVector / AICPU / HBM BW: not sampled yet",
+                card.ddr_used_mb, card.ddr_total_mb
+            )),
+        ],
+        None => vec![Line::from(" No NPU detected")],
+    };
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title("Chip"));
+    frame.render_widget(para, area);
+}
+
+fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let header = Row::new(["PID", "NAME", "NPU", "HBM(MB)"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = app.npu_procs.iter().map(|row| {
+        Row::new(vec![
+            Cell::from(row.pid.to_string()),
+            Cell::from(row.name.clone()),
+            Cell::from(row.cards_label()),
+            Cell::from(format!("{:>10}", row.hbm_mb)),
+        ])
+    });
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Min(20),
+        Constraint::Length(8),
+        Constraint::Length(12),
+    ];
+    let mut state = TableState::default();
+    state.select((!app.npu_procs.is_empty()).then_some(app.npu_selected));
+    let title = if app.npu_focus == NpuFocus::Procs {
+        format!("NPU processes * ({})", app.npu_procs.len())
+    } else {
+        format!("NPU processes ({})", app.npu_procs.len())
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol("\u{25b6} ");
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn health_style(health: Health) -> Style {
+    let color = match health {
+        Health::Ok => Color::Green,
+        Health::Warning => Color::Yellow,
+        Health::Alarm | Health::Critical => Color::Red,
+        Health::Unknown => Color::DarkGray,
+    };
+    Style::default().fg(color)
+}
+
+/// 910B junction temperature: warn above 70C, critical above 80C.
+fn temp_color(temp: f32) -> Color {
+    if temp < 70.0 {
+        Color::Green
+    } else if temp <= 80.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn hbm_color(pct: f64) -> Color {
+    if pct < 80.0 {
+        Color::Green
+    } else if pct < 90.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Idle AICore is normal, so only "busy" is coloured; the absence of load
+/// is shown grey rather than green/red.
+fn util_color(pct: f32) -> Color {
+    if pct < 1.0 {
+        Color::DarkGray
+    } else {
+        Color::Green
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +637,28 @@ mod tests {
         assert_eq!(load_color(84.9), Color::Yellow);
         assert_eq!(load_color(85.0), Color::Red);
         assert_eq!(load_color(200.0), Color::Red);
+    }
+
+    #[test]
+    fn npu_temperature_thresholds() {
+        assert_eq!(temp_color(0.0), Color::Green);
+        assert_eq!(temp_color(69.9), Color::Green);
+        assert_eq!(temp_color(70.0), Color::Yellow);
+        assert_eq!(temp_color(80.0), Color::Yellow);
+        assert_eq!(temp_color(80.1), Color::Red);
+    }
+
+    #[test]
+    fn npu_hbm_thresholds() {
+        assert_eq!(hbm_color(0.0), Color::Green);
+        assert_eq!(hbm_color(80.0), Color::Yellow);
+        assert_eq!(hbm_color(90.0), Color::Red);
+    }
+
+    #[test]
+    fn npu_idle_util_is_grey_not_red() {
+        assert_eq!(util_color(0.0), Color::DarkGray);
+        assert_eq!(util_color(1.0), Color::Green);
     }
 
     #[test]
