@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `npu-smi -v` startup probe now has a 2 s deadline and is killed when it
+  hangs, matching the "every subprocess has a deadline" rule. Previously a
+  wedged driver blocked `run()` before raw mode was even enabled, leaving the
+  TUI invisible with an unreaped child.
+- Terminal initialisation failures after `enable_raw_mode()` now restore the
+  terminal before returning: a failed `EnterAlternateScreen`/mouse-capture or
+  `Terminal::new` no longer leaves the shell in raw mode behind the alternate
+  screen.
 - `npu-smi` 25.x writes HBM usage as `57636/ 65536` without a space before
   the slash; this used to parse as zero. Both the spaced (24.x) and tight
   (25.x) forms are now accepted.

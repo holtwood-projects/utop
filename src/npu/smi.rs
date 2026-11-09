@@ -16,6 +16,8 @@ use super::model::{Health, NpuCard, NpuProcess, NpuSnapshot};
 
 /// `npu-smi info` is the only call on the hot path; keep it bounded.
 const INFO_TIMEOUT: Duration = Duration::from_secs(8);
+/// Startup probe runs before raw mode; a hung driver must not block the TUI.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum SmiError {
@@ -69,14 +71,11 @@ fn command(args: &[&str]) -> Command {
     cmd
 }
 
-/// True when the tool can be spawned. Does not prove a device is present.
+/// True when the tool answers `-v` before [`PROBE_TIMEOUT`]. Does not prove a
+/// device is present. Uses the same deadline loop as [`collect`] so a hung
+/// driver cannot block startup before the terminal is initialised.
 pub fn available() -> bool {
-    command(&["-v"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+    run(&["-v"], PROBE_TIMEOUT).is_ok()
 }
 
 /// Takes one `npu-smi info` sample.

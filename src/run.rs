@@ -55,9 +55,20 @@ pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // 初始化失败也必须恢复终端；否则 shell 会停在 raw mode + 备用屏幕。
+    if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        // execute! 可能已经写入备用屏幕序列；统一走 teardown，不能只关 raw mode。
+        restore_terminal();
+        return Err(err.into());
+    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            restore_terminal();
+            return Err(err.into());
+        }
+    };
 
     let res = event_loop(&mut terminal, config, &mut sys, npu_feed);
 
