@@ -14,7 +14,8 @@ use crate::model::{
     Pid, ProcDetails, ProcRow, SignalKind, SortKey, SysStats, resolve_selected_index, sort_rows,
 };
 use crate::npu::model::{
-    NpuCard, NpuProcRow, NpuSnapshot, filter_proc_rows, sort_proc_rows, update_idle_streaks,
+    CardHist, NpuCard, NpuProcRow, NpuSnapshot, filter_proc_rows, sort_proc_rows,
+    update_card_history, update_idle_streaks,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +111,8 @@ pub(crate) struct App {
     pub(crate) npu_visible: Option<Vec<u32>>,
     /// Consecutive hot-but-idle samples per card (`model::update_idle_streaks`).
     pub(crate) npu_idle: HashMap<u32, u32>,
+    /// Per-card AICore/HBM history for the detail-pane sparklines.
+    pub(crate) npu_hist: HashMap<u32, CardHist>,
 }
 
 impl App {
@@ -143,6 +146,7 @@ impl App {
             npu_desc: true,
             npu_visible: None,
             npu_idle: HashMap::new(),
+            npu_hist: HashMap::new(),
         }
     }
 
@@ -311,6 +315,7 @@ impl App {
         }
         self.npu = snapshot;
         update_idle_streaks(&mut self.npu_idle, &self.npu.cards);
+        update_card_history(&mut self.npu_hist, &self.npu.cards);
         self.npu_all_procs = self.npu.aggregate_processes();
         sort_proc_rows(&mut self.npu_all_procs, self.npu_desc);
         self.reshape_npu_procs();
@@ -358,7 +363,9 @@ impl App {
         let (pid, name) = match (self.view, self.npu_focus) {
             (View::Npu, NpuFocus::Procs) => {
                 let row = self.npu_procs.get(self.npu_selected)?;
-                (Pid::from_u32(row.pid), row.name.clone())
+                // `npu-smi` lists the host pid, which does not exist in
+                // a namespaced container — the container pid does.
+                (Pid::from_u32(row.signal_pid()), row.name.clone())
             }
             // Killing a card makes no sense; require the process pane.
             (View::Npu, NpuFocus::Cards) => return None,

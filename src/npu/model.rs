@@ -4,7 +4,7 @@
 //! read them. Keeping the model pure is what lets the parsers be tested
 //! against fixtures without a live NPU.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
 /// Chip health as reported by `npu-smi`.
@@ -142,6 +142,39 @@ impl ProcExtra {
     }
 }
 
+/// Rolling per-card history, kept on `App` for the detail-pane
+/// sparklines: `npu-smi` only reports instant values, so trends need a
+/// few minutes of rounds.
+#[derive(Clone, Debug, Default)]
+pub struct CardHist {
+    /// AI Core utilisation percent, one point per sampling round.
+    pub aicore: VecDeque<u64>,
+    /// HBM fill percent, one point per sampling round.
+    pub hbm: VecDeque<u64>,
+}
+
+/// About four minutes at the ~1 s collector cadence.
+const HIST_CAP: usize = 240;
+
+/// Pushes one round of readings into per-card ring buffers; histories of
+/// cards that left the table are dropped.
+pub fn update_card_history(hists: &mut HashMap<u32, CardHist>, cards: &[NpuCard]) {
+    let alive: Vec<u32> = cards.iter().map(|c| c.index).collect();
+    hists.retain(|card, _| alive.contains(card));
+    for card in cards {
+        let hist = hists.entry(card.index).or_default();
+        push_cap(&mut hist.aicore, card.aicore_pct.round() as u64);
+        push_cap(&mut hist.hbm, card.hbm_pct().round() as u64);
+    }
+}
+
+fn push_cap(buf: &mut VecDeque<u64>, value: u64) {
+    if buf.len() >= HIST_CAP {
+        buf.pop_front();
+    }
+    buf.push_back(value);
+}
+
 /// A process aggregated across every card it occupies.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NpuProcRow {
@@ -160,6 +193,17 @@ impl NpuProcRow {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// The pid a signal should target in *this* PID namespace: the
+    /// container pid when `/proc` was reached through it, otherwise the
+    /// host pid `npu-smi` reported (which will fail with ESRCH when it
+    /// has no local `/proc` entry).
+    pub fn signal_pid(&self) -> u32 {
+        self.extra
+            .as_ref()
+            .and_then(|extra| extra.local_pid)
+            .unwrap_or(self.pid)
     }
 }
 
@@ -578,6 +622,46 @@ mod tests {
         // Free function keeps no extras (public API unchanged).
         let rows = aggregate_processes(&snapshot.processes);
         assert!(rows[0].extra.is_none());
+    }
+
+    #[test]
+    fn signal_pid_prefers_local_pid_then_host_pid() {
+        let mut row = NpuProcRow {
+            pid: 4000000,
+            ..Default::default()
+        };
+        assert_eq!(row.signal_pid(), 4000000);
+        row.extra = Some(ProcExtra {
+            visible: true,
+            local_pid: Some(88),
+            via_container_pid: true,
+            ..Default::default()
+        });
+        assert_eq!(row.signal_pid(), 88);
+    }
+
+    #[test]
+    fn card_history_caps_and_drops_vanished_cards() {
+        let mut hists = HashMap::new();
+        let card = |index: u32, aicore: f32, used: u64| NpuCard {
+            index,
+            aicore_pct: aicore,
+            hbm_used_mb: used,
+            hbm_total_mb: 100,
+            ..Default::default()
+        };
+        update_card_history(&mut hists, &[card(0, 50.0, 60)]);
+        update_card_history(&mut hists, &[card(0, 60.0, 70), card(1, 10.0, 20)]);
+        let hist = &hists[&0];
+        assert_eq!(
+            hist.aicore.iter().copied().collect::<Vec<_>>(),
+            vec![50, 60]
+        );
+        assert_eq!(hist.hbm.iter().copied().collect::<Vec<_>>(), vec![60, 70]);
+        // Card 0 gone: its history is dropped, card 1 keeps growing.
+        update_card_history(&mut hists, &[card(1, 20.0, 30)]);
+        assert!(!hists.contains_key(&0));
+        assert_eq!(hists[&1].aicore.len(), 2);
     }
 
     #[test]

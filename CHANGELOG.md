@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   navigating processes.
 - `--once` text output gains a `CTN` column; `--json` process objects gain
   `container_pid`, `visible`, `user`, `container` and `cmdline` fields.
+- btop-style dressing on the NPU view: fill meters on the AICORE and HBM
+  columns, `▁▂▃▄▅▆▇█` sparklines of AICore and HBM history on the selected
+  card (one point per round, ~4 min kept), and rounded borders.
 - `npu/procfs`: the only module that reads `/proc`; injectable roots keep
   the parsers unit-testable.
 - Fixture-based parser tests (`tests/fixtures/`, `tests/npu_parse.rs`), so
@@ -57,7 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The default view is the NPU screen when `npu-smi` is present; without it
   utop falls back to the original system view.
 - Killing a host-side PID from inside a container reports "not reachable
-  from this namespace" instead of the misleading "no longer exists".
+  from this namespace" instead of the misleading "no longer exists". Kill
+  now targets the *container* pid for same-container processes (`npu-smi`
+  26.x), so a visible worker is actually signalable from inside its own
+  container instead of always failing with ESRCH.
 - The module boundary is now real instead of aspirational: `collect` is
   literally the only module that imports sysinfo. The UI reads snapshot
   structs (`SysStats` / `ProcDetails`) stored on `App`, the event loop

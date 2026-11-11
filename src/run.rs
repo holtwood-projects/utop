@@ -236,12 +236,12 @@ fn settle(sys: &mut System, app: &mut App) {
                 app.set_status(format!("{} unsupported on this platform", kind.name()));
             }
             KillOutcome::Gone => {
-                // On the NPU view the PID may be host-side and simply
-                // invisible in this container's PID namespace.
+                // On the NPU view the signalled pid may be host-side and
+                // simply invisible in this container's PID namespace.
                 let host_side = app
                     .npu_procs
                     .iter()
-                    .find(|row| row.pid == pid.as_u32())
+                    .find(|row| row.signal_pid() == pid.as_u32())
                     .and_then(|row| row.extra.as_ref())
                     .is_some_and(|extra| !extra.visible);
                 if host_side {

@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::app::{App, InputMode, NpuFocus, View};
@@ -457,8 +457,8 @@ fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Length(6),
         Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(18),
+        Constraint::Length(12),
+        Constraint::Min(16),
         Constraint::Length(7),
     ];
     let mut state = TableState::default();
@@ -470,10 +470,42 @@ fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(title),
+        )
         .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("\u{25b6} ");
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// `█████░░░░░`-style meter for the card table; `pct` may exceed 100 on
+/// misbehaving counters and still renders a full bar.
+fn meter(pct: f64, width: usize) -> String {
+    let filled = ((pct.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
+    format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(width - filled)
+    )
+}
+
+/// `▁▂▃▄▅▆▇█` trend text for the detail pane. Takes the newest `width`
+/// samples, left-padded so the recent edge stays on the right.
+fn sparkline(values: &std::collections::VecDeque<u64>, width: usize) -> String {
+    const SPARK: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let take = values.len().min(width);
+    let mut out = String::with_capacity(width);
+    out.push_str(&" ".repeat(width - take));
+    for value in values.iter().skip(values.len() - take) {
+        out.push(SPARK[(*value).min(100) as usize * 7 / 100]);
+    }
+    out
 }
 
 fn card_row(app: &App, card: &NpuCard) -> Row<'static> {
@@ -505,12 +537,17 @@ fn card_row(app: &App, card: &NpuCard) -> Row<'static> {
         )),
         Cell::from(format!("{:.0}W", card.power_w)),
         Cell::from(Span::styled(
-            format!("{:.0}%", card.aicore_pct),
+            format!(
+                "{} {:>3.0}%",
+                meter(card.aicore_pct as f64, 5),
+                card.aicore_pct
+            ),
             Style::default().fg(util_color(card.aicore_pct)),
         )),
         Cell::from(Span::styled(
             format!(
-                "{:.1}/{:.0}G",
+                "{} {:.1}/{:.0}G",
+                meter(card.hbm_pct(), 5),
                 card.hbm_used_mb as f64 / 1024.0,
                 card.hbm_total_mb as f64 / 1024.0
             ),
@@ -528,19 +565,42 @@ fn draw_npu_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         None
     };
+    let spark_width = (area.width as usize).saturating_sub(14).max(10);
     let (title, lines) = match selected_proc {
         Some(row) => ("Process", npu_proc_lines(row)),
-        None => ("Chip", npu_card_lines(app)),
+        None => ("Chip", npu_card_lines(app, spark_width)),
     };
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(title),
+    );
     frame.render_widget(para, area);
+}
+
+/// Sparkline row for one history buffer, coloured by its latest value.
+fn hist_line(
+    label: &str,
+    values: &std::collections::VecDeque<u64>,
+    color_for: impl Fn(f32) -> Color,
+    width: usize,
+) -> Option<Line<'static>> {
+    if values.len() < 2 {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::raw(format!(" {label} ")),
+        Span::styled(
+            sparkline(values, width),
+            Style::default().fg(color_for(*values.back()? as f32)),
+        ),
+    ]))
 }
 
 /// Selected-card metrics: the `info` fields plus whatever the `-t`
 /// detail round produced (usage rates, frequency, ECC).
-fn npu_card_lines(app: &App) -> Vec<Line<'static>> {
+fn npu_card_lines(app: &App, spark_width: usize) -> Vec<Line<'static>> {
     let Some(card) = app.selected_card() else {
         return vec![Line::from(" No NPU detected")];
     };
@@ -615,6 +675,25 @@ fn npu_card_lines(app: &App) -> Vec<Line<'static>> {
             " AIVector / AICPU / HBM BW / ECC / Freq: sampling...",
         )),
     }
+
+    // Trend lines accumulate one point per round; a couple of minutes of
+    // history turns the instant counters into a workload shape.
+    if let Some(hist) = app.npu_hist.get(&card.index) {
+        for line in [
+            hist_line("AICore", &hist.aicore, util_color, spark_width),
+            hist_line(
+                "HBM   ",
+                &hist.hbm,
+                |pct| hbm_color(pct as f64),
+                spark_width,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            lines.push(line);
+        }
+    }
     lines
 }
 
@@ -674,10 +753,11 @@ fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
     let rows = app.npu_procs.iter().map(|row| {
+        // docker short ids are 12 hex chars; truncate only beyond that.
         let ctn = row
             .extra
             .as_ref()
-            .map(|extra| extra.ctn_label().chars().take(10).collect::<String>())
+            .map(|extra| extra.ctn_label().chars().take(12).collect::<String>())
             .unwrap_or_else(|| "-".to_string());
         Row::new(vec![
             Cell::from(row.pid.to_string()),
@@ -691,7 +771,7 @@ fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Min(20),
         Constraint::Length(8),
-        Constraint::Length(11),
+        Constraint::Length(13),
         Constraint::Length(12),
     ];
     let mut state = TableState::default();
@@ -703,7 +783,12 @@ fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(title),
+        )
         .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("\u{25b6} ");
     frame.render_stateful_widget(table, area, &mut state);
@@ -812,6 +897,24 @@ mod tests {
     fn npu_idle_util_is_grey_not_red() {
         assert_eq!(util_color(0.0), Color::DarkGray);
         assert_eq!(util_color(1.0), Color::Green);
+    }
+
+    #[test]
+    fn meter_fills_and_clamps() {
+        assert_eq!(meter(0.0, 5), "░░░░░");
+        assert_eq!(meter(100.0, 5), "█████");
+        assert_eq!(meter(50.0, 4), "██░░");
+        assert_eq!(meter(120.0, 5), "█████");
+    }
+
+    #[test]
+    fn sparkline_maps_levels_and_right_aligns() {
+        let values: std::collections::VecDeque<u64> = [0, 50, 100].into();
+        assert_eq!(sparkline(&values, 5), "  ▁▄█");
+        // Fewer than two samples render nothing useful — callers skip it,
+        // but the helper still returns a padded string.
+        let one: std::collections::VecDeque<u64> = [100].into();
+        assert_eq!(sparkline(&one, 3), "  █");
     }
 
     #[test]
