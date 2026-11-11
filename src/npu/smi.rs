@@ -14,8 +14,14 @@ use std::time::{Duration, Instant};
 
 use super::model::{Health, NpuCard, NpuProcess, NpuSnapshot};
 
+// Re-exported so `smi::UsageSample`-style paths keep working after the
+// sample types moved into `model` (pure data belongs to the pure layer).
+pub use super::model::{CommonSample, EccSample, UsageSample};
+
 /// `npu-smi info` is the only call on the hot path; keep it bounded.
 const INFO_TIMEOUT: Duration = Duration::from_secs(8);
+/// `-t` detail queries (usages / common / ecc) are one call per card.
+const DETAIL_TIMEOUT: Duration = Duration::from_secs(4);
 /// Startup probe runs before raw mode; a hung driver must not block the TUI.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -86,8 +92,41 @@ pub fn collect() -> Result<NpuSnapshot, SmiError> {
     Ok(snapshot)
 }
 
+/// `npu-smi info -t usages -i <card>`: per-chip utilisation rates,
+/// including the HBM bandwidth figure that separates memory-bound work
+/// from compute-bound work on 910B.
+pub fn collect_usages(card: u32) -> Result<UsageSample, SmiError> {
+    let card = card.to_string();
+    let text = run(&["info", "-t", "usages", "-i", &card], DETAIL_TIMEOUT)?;
+    Ok(parse_usages(&text))
+}
+
+/// `npu-smi info -t common -i <card>`: frequency, core count, MCU
+/// temperature.
+pub fn collect_common(card: u32) -> Result<CommonSample, SmiError> {
+    let card = card.to_string();
+    let text = run(&["info", "-t", "common", "-i", &card], DETAIL_TIMEOUT)?;
+    Ok(parse_common(&text))
+}
+
+/// `npu-smi info -t ecc -i <card>`: HBM error counters. The collector
+/// calls this round-robin — one card per round keeps subprocess count
+/// bounded while still sweeping the whole machine in seconds.
+pub fn collect_ecc(card: u32) -> Result<EccSample, SmiError> {
+    let card = card.to_string();
+    let text = run(&["info", "-t", "ecc", "-i", &card], DETAIL_TIMEOUT)?;
+    Ok(parse_ecc(&text))
+}
+
 fn run(args: &[&str], timeout: Duration) -> Result<String, SmiError> {
-    let mut child = command(args)
+    run_deadline(&mut command(args), timeout)
+}
+
+/// Spawn `cmd` and collect stdout with a deadline; the child is killed on
+/// timeout. Shared by `npu-smi` and the `docker ps` name lookup so every
+/// subprocess in the crate has the same hang protection.
+pub(crate) fn run_deadline(cmd: &mut Command, timeout: Duration) -> Result<String, SmiError> {
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -372,10 +411,14 @@ fn parse_process(cells: &[&str]) -> Option<NpuProcess> {
     let pid = cells[1].parse().ok()?;
     let name = cells[2].to_string();
     let hbm_mb = cells[3].parse().unwrap_or(0);
+    // `npu-smi` 26.x appends a "Process id in container" column; older
+    // releases stop at four cells.
+    let container_pid = cells.get(4).and_then(|cell| cell.parse().ok());
     Some(NpuProcess {
         card,
         chip,
         pid,
+        container_pid,
         name,
         hbm_mb,
     })
@@ -439,18 +482,7 @@ fn kv_u64(kv: &[(String, String)], key: &str) -> Option<u64> {
     kv_f32(kv, key).map(|value| value.max(0.0) as u64)
 }
 
-/// Parses `npu-smi info -t usages -i N`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct UsageSample {
-    pub hbm_capacity_mb: u64,
-    pub hbm_usage_pct: f32,
-    pub aicore_pct: f32,
-    pub aivector_pct: f32,
-    pub aicpu_pct: f32,
-    pub ctrlcpu_pct: f32,
-    pub hbm_bw_pct: f32,
-}
-
+/// Parses `npu-smi info -t usages -i N` output.
 pub fn parse_usages(text: &str) -> UsageSample {
     let kv = parse_kv(text);
     UsageSample {
@@ -464,17 +496,7 @@ pub fn parse_usages(text: &str) -> UsageSample {
     }
 }
 
-/// Parses `npu-smi info -t common -i N`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct CommonSample {
-    pub aicore_freq_mhz: u32,
-    pub aicore_cur_freq_mhz: u32,
-    pub aicore_count: u32,
-    pub temp_c: f32,
-    pub power_w: f32,
-    pub mcu_temp_c: Option<f32>,
-}
-
+/// Parses `npu-smi info -t common -i N` output.
 pub fn parse_common(text: &str) -> CommonSample {
     let kv = parse_kv(text);
     // The MCU block reports a second `Temperature(C)`; `parse_kv` keeps the
@@ -497,14 +519,7 @@ pub fn parse_common(text: &str) -> CommonSample {
     }
 }
 
-/// Parses `npu-smi info -t ecc -i N`, summing every reported HBM block.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct EccSample {
-    pub single_bit: u64,
-    pub double_bit: u64,
-    pub isolated_pages: u64,
-}
-
+/// Parses `npu-smi info -t ecc -i N` output, summing every HBM block.
 pub fn parse_ecc(text: &str) -> EccSample {
     let mut sample = EccSample::default();
     for (key, value) in parse_kv(text) {
@@ -572,15 +587,21 @@ pub fn render_text(snapshot: &NpuSnapshot) -> String {
         return out;
     }
     out.push_str(&format!(
-        "\n{:<8} {:<24} {:<8} {:>12}\n",
-        "PID", "NAME", "NPU", "HBM(MB)"
+        "\n{:<8} {:<24} {:<8} {:<10} {:>12}\n",
+        "PID", "NAME", "NPU", "CTN", "HBM(MB)"
     ));
     for row in rows {
+        let ctn = row
+            .extra
+            .as_ref()
+            .map(|extra| extra.ctn_label())
+            .unwrap_or("-");
         out.push_str(&format!(
-            "{:<8} {:<24} {:<8} {:>12}\n",
+            "{:<8} {:<24} {:<8} {:<10} {:>12}\n",
             row.pid,
             row.name,
             row.cards_label(),
+            ctn,
             row.hbm_mb
         ));
     }
@@ -631,13 +652,29 @@ pub fn to_json(snapshot: &NpuSnapshot) -> String {
         } else {
             ","
         };
+        let extra = snapshot.extras.get(&process.pid);
+        let json_str = |value: Option<&String>| match value {
+            Some(value) => format!("\"{}\"", escape_json(value)),
+            None => "null".to_string(),
+        };
+        let container_pid = match process.container_pid {
+            Some(pid) => pid.to_string(),
+            None => "null".to_string(),
+        };
         out.push_str(&format!(
-            "    {{\"card\": {}, \"chip\": {}, \"pid\": {}, \"name\": \"{}\", \"hbm_mb\": {}}}{}\n",
+            "    {{\"card\": {}, \"chip\": {}, \"pid\": {}, \"container_pid\": {}, \
+             \"name\": \"{}\", \"hbm_mb\": {}, \
+             \"visible\": {}, \"user\": {}, \"container\": {}, \"cmdline\": {}}}{}\n",
             process.card,
             process.chip,
             process.pid,
+            container_pid,
             escape_json(&process.name),
             process.hbm_mb,
+            extra.map(|e| e.visible).unwrap_or(false),
+            json_str(extra.and_then(|e| e.user.as_ref())),
+            json_str(extra.and_then(|e| e.container.as_ref())),
+            json_str(extra.and_then(|e| e.cmdline.as_ref())),
             comma
         ));
     }

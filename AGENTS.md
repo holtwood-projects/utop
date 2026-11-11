@@ -22,9 +22,10 @@ cargo run --release                         # 本地直接运行 utop
 - `src/collect.rs` — sysinfo 快照，唯一 import sysinfo 的模块
 - `src/ui.rs` — ratatui 渲染，纯渲染，只读 `App` 中的快照
 - `src/cli.rs` — 命令行参数解析（纯解析器）
-- `src/npu/model.rs` — NPU 卡 / 进程模型、聚合与排序（纯逻辑）
-- `src/npu/smi.rs` — `npu-smi` 调用与文本解析，唯一子进程入口
-- `src/npu/collect.rs` — 后台采集线程，latest-wins 投递
+- `src/npu/model.rs` — NPU 卡 / 进程模型、聚合、排序与卡标记（纯逻辑）
+- `src/npu/smi.rs` — `npu-smi` 调用与文本解析（`info` 与 `-t` 详情），唯一的 npu-smi 子进程入口
+- `src/npu/procfs.rs` — `/proc` 进程增强与容器归属（cgroup→容器 id，可选 `docker ps` 名字映射），唯一的 /proc 读取点
+- `src/npu/collect.rs` — `NpuCollector` 采样编排 + 后台采集线程，latest-wins 投递
 - `src/npu/report.rs` — `--once` / `--json` 一次性输出
 - `tests/api.rs` — 通过公开 API（`utop::cli` / `utop::model`）的集成测试
 - `tests/npu_parse.rs` — 基于 `tests/fixtures/` 的 NPU 解析测试（无需真卡）
@@ -36,6 +37,7 @@ cargo run --release                         # 本地直接运行 utop
 - 除 `run` 与 `collect` 外全部是纯逻辑，单元测试无需真实系统；输入处理器通过 `Followup` 记录后续动作，由事件循环代为执行
 - sysinfo 只允许出现在 `collect`；UI 只读快照结构（`SysStats` / `ProcDetails`），不直接触碰 `System`
 - `npu-smi` 只允许出现在 `npu/smi.rs`；每次调用必须有超时，且不得在渲染线程执行
+- `/proc` 读取只允许出现在 `npu/procfs.rs`；`docker ps` 只允许出现在那里（2s 超时，30s 缓存）；宿主机进程增强不得引入新依赖
 - NPU 采集线程与 UI 之间只传纯数据快照；UI 不持有子进程或驱动句柄
 - Rust edition 2024，依赖仅 crossterm / ratatui / sysinfo 三个 crate（NPU 采集不引入新依赖）
 - rustfmt：max_width 100、4 空格缩进、Unix 换行；.editorconfig 对 yml/json/toml 用 2 空格缩进

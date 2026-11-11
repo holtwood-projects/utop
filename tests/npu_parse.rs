@@ -9,6 +9,10 @@ const IDLE: &str = include_str!("fixtures/npu-smi-info-idle.txt");
 const INFO_25: &str = include_str!("fixtures/npu-smi-info-25.2.txt");
 const USAGES_25: &str = include_str!("fixtures/npu-smi-usages-25.2.txt");
 const ECC_25: &str = include_str!("fixtures/npu-smi-ecc-25.2.txt");
+const INFO_26: &str = include_str!("fixtures/npu-smi-info-26.1.txt");
+const USAGES_26: &str = include_str!("fixtures/npu-smi-usages-26.1.txt");
+const COMMON_26: &str = include_str!("fixtures/npu-smi-common-26.1.txt");
+const ECC_26: &str = include_str!("fixtures/npu-smi-ecc-26.1.txt");
 
 #[test]
 fn parses_tool_and_driver_versions() {
@@ -104,6 +108,48 @@ fn json_output_is_well_formed_for_the_fixture() {
 }
 
 #[test]
+fn json_carries_proc_extras_when_enriched() {
+    let mut snapshot = utop::npu::model::NpuSnapshot::default();
+    let parsed = smi::parse_info(INFO);
+    snapshot.cards = parsed.cards;
+    snapshot.processes = parsed.processes;
+    snapshot.extras.insert(
+        51100,
+        utop::npu::model::ProcExtra {
+            visible: true,
+            user: Some("root".into()),
+            container: Some("pytorch".into()),
+            cmdline: Some("python3 train.py".into()),
+            ..Default::default()
+        },
+    );
+    let json = smi::to_json(&snapshot);
+    assert!(json.contains("\"visible\": true"));
+    assert!(json.contains("\"container\": \"pytorch\""));
+    // An unenriched process serialises nulls, not missing fields.
+    assert!(json.contains("\"container\": null"));
+}
+
+#[test]
+fn text_output_shows_container_column() {
+    let mut snapshot = utop::npu::model::NpuSnapshot::default();
+    let parsed = smi::parse_info(INFO);
+    snapshot.cards = parsed.cards;
+    snapshot.processes = parsed.processes;
+    snapshot.extras.insert(
+        51100,
+        utop::npu::model::ProcExtra {
+            visible: true,
+            container: Some("pytorch".into()),
+            ..Default::default()
+        },
+    );
+    let text = smi::render_text(&snapshot);
+    assert!(text.contains("CTN"));
+    assert!(text.contains("pytorch"));
+}
+
+#[test]
 fn parses_real_25_2_sample_with_non_contiguous_cards() {
     let parsed = smi::parse_info(INFO_25);
     assert_eq!(parsed.tool_version, "25.2.1");
@@ -140,4 +186,50 @@ fn parses_real_ecc_sample() {
     assert_eq!(sample.single_bit, 0);
     assert_eq!(sample.double_bit, 0);
     assert_eq!(sample.isolated_pages, 0);
+}
+
+#[test]
+fn parses_real_26_1_sample_with_container_pids() {
+    let parsed = smi::parse_info(INFO_26);
+    assert_eq!(parsed.tool_version, "26.1.1");
+    assert_eq!(parsed.cards.len(), 8);
+    assert_eq!(parsed.cards[0].name, "910B1");
+    assert_eq!(parsed.cards[3].hbm_used_mb, 3644);
+    // 26.x adds a "Process id in container" column — every process row
+    // must carry it for the in-container /proc fallback to work.
+    assert_eq!(parsed.processes.len(), 5);
+    let keeper = parsed
+        .processes
+        .iter()
+        .find(|p| p.name == "keeper")
+        .expect("keeper process");
+    assert_eq!(keeper.card, 5);
+    assert_eq!(keeper.pid, 3278134);
+    assert_eq!(keeper.container_pid, Some(1679803));
+    assert_eq!(keeper.hbm_mb, 112);
+    let python = parsed
+        .processes
+        .iter()
+        .find(|p| p.pid == 2599973)
+        .expect("card-0 python");
+    assert_eq!(python.container_pid, Some(1241747));
+}
+
+#[test]
+fn parses_26_x_detail_samples() {
+    // 26.x adds NPU Utilization / Aicube keys; unknown keys are skipped.
+    let usages = smi::parse_usages(USAGES_26);
+    assert_eq!(usages.hbm_capacity_mb, 65536);
+    assert_eq!(usages.hbm_usage_pct, 5.0);
+    assert_eq!(usages.ctrlcpu_pct, 2.0);
+    let common = smi::parse_common(COMMON_26);
+    assert_eq!(common.aicore_freq_mhz, 1850);
+    assert_eq!(common.aicore_cur_freq_mhz, 800);
+    assert_eq!(common.aicore_count, 25);
+    assert_eq!(common.mcu_temp_c, Some(43.0));
+    let ecc = smi::parse_ecc(ECC_26);
+    assert_eq!(
+        (ecc.single_bit, ecc.double_bit, ecc.isolated_pages),
+        (0, 0, 0)
+    );
 }

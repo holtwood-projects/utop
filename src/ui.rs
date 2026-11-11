@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::app::{App, InputMode, NpuFocus, View};
 use crate::model::{ProcRow, SortKey, SysStats, display_name};
-use crate::npu::model::{Health, NpuCard};
+use crate::npu::model::{CardFlag, Health, NpuCard, NpuProcRow, card_flag};
 
 pub(crate) fn ui(frame: &mut ratatui::Frame<'_>, app: &App, table_state: &mut TableState) {
     match app.view {
@@ -388,6 +388,21 @@ fn npu_header_lines(app: &App) -> Vec<Line<'static>> {
             )
         }),
     ];
+    if let Some(visible) = &app.npu_visible {
+        let list = if visible.is_empty() {
+            "none".to_string()
+        } else {
+            visible
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        first.push(Span::styled(
+            format!("  RT_VISIBLE={list}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if app.paused {
         first.push(Span::styled(
             "  PAUSED",
@@ -427,12 +442,15 @@ fn npu_header_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let header = Row::new(["NPU", "NAME", "HEALTH", "TEMP", "POWER", "AICORE", "HBM"]).style(
+    let header = Row::new([
+        "NPU", "NAME", "HEALTH", "TEMP", "POWER", "AICORE", "HBM", "NOTE",
+    ])
+    .style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     );
-    let rows = app.npu.cards.iter().map(card_row);
+    let rows = app.npu.cards.iter().map(|card| card_row(app, card));
     let widths = [
         Constraint::Length(4),
         Constraint::Length(10),
@@ -441,6 +459,7 @@ fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Min(18),
+        Constraint::Length(7),
     ];
     let mut state = TableState::default();
     state.select((!app.npu.cards.is_empty()).then_some(app.npu_card_selected));
@@ -457,7 +476,25 @@ fn draw_npu_cards(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn card_row(card: &NpuCard) -> Row<'static> {
+fn card_row(app: &App, card: &NpuCard) -> Row<'static> {
+    let note = card_flag(
+        card,
+        app.npu.ecc.get(&card.index),
+        app.npu_idle.get(&card.index).copied().unwrap_or(0),
+        app.npu_visible.as_deref(),
+    )
+    .map(|flag| {
+        let color = match flag {
+            CardFlag::EccAlarm => Color::Red,
+            CardFlag::EccWarn | CardFlag::Idle => Color::Yellow,
+            CardFlag::Masked => Color::DarkGray,
+        };
+        Cell::from(Span::styled(
+            flag.label().to_string(),
+            Style::default().fg(color),
+        ))
+    })
+    .unwrap_or_else(|| Cell::from(""));
     Row::new(vec![
         Cell::from(card.index.to_string()),
         Cell::from(card.name.clone()),
@@ -479,59 +516,174 @@ fn card_row(card: &NpuCard) -> Row<'static> {
             ),
             Style::default().fg(hbm_color(card.hbm_pct())),
         )),
+        note,
     ])
 }
 
+/// The middle pane follows the table that has focus: card metrics while
+/// navigating cards, process details while navigating the process table.
 fn draw_npu_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let lines = match app.selected_card() {
-        Some(card) => vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" NPU {}  ", card.index),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("{}  ", card.name)),
-                Span::styled(card.health.label().to_string(), health_style(card.health)),
-                Span::raw(format!(
-                    "  {:.0}C  {:.1}W  AICore {:.0}%",
-                    card.temp_c, card.power_w, card.aicore_pct
-                )),
-            ]),
-            Line::from(format!(
-                " Bus {}  HBM {}/{} MB ({:.1}%)  Hugepages {}/{}",
-                card.bus_id,
-                card.hbm_used_mb,
-                card.hbm_total_mb,
-                card.hbm_pct(),
-                card.hugepages_used,
-                card.hugepages_total
-            )),
-            Line::from(format!(
-                " DDR {}/{} MB  |  AIVector / AICPU / HBM BW: not sampled yet",
-                card.ddr_used_mb, card.ddr_total_mb
-            )),
-        ],
-        None => vec![Line::from(" No NPU detected")],
+    let selected_proc = if app.npu_focus == NpuFocus::Procs {
+        app.npu_procs.get(app.npu_selected)
+    } else {
+        None
+    };
+    let (title, lines) = match selected_proc {
+        Some(row) => ("Process", npu_proc_lines(row)),
+        None => ("Chip", npu_card_lines(app)),
     };
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).title("Chip"));
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(para, area);
 }
 
+/// Selected-card metrics: the `info` fields plus whatever the `-t`
+/// detail round produced (usage rates, frequency, ECC).
+fn npu_card_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(card) = app.selected_card() else {
+        return vec![Line::from(" No NPU detected")];
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" NPU {}  ", card.index),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{}  ", card.name)),
+            Span::styled(card.health.label().to_string(), health_style(card.health)),
+            Span::raw(format!(
+                "  {:.0}C  {:.1}W  AICore {:.0}%",
+                card.temp_c, card.power_w, card.aicore_pct
+            )),
+        ]),
+        Line::from(format!(
+            " Bus {}  HBM {}/{} MB ({:.1}%)  Hugepages {}/{}",
+            card.bus_id,
+            card.hbm_used_mb,
+            card.hbm_total_mb,
+            card.hbm_pct(),
+            card.hugepages_used,
+            card.hugepages_total
+        )),
+    ];
+
+    // Detail rows come from the `-t` calls; they describe the card that
+    // was selected when the round started, so discard a stale match.
+    match app.npu.detail.as_ref().filter(|d| d.card == card.index) {
+        Some(detail) => {
+            let usage = detail.usage.as_ref();
+            let common = detail.common.as_ref();
+            lines.push(Line::from(format!(
+                " AIVec {}%  AICPU {}%  Ctrl {}%  HBM-BW {}%   |   ECC {}",
+                usage
+                    .map(|u| u.aivector_pct.to_string())
+                    .unwrap_or("-".into()),
+                usage.map(|u| u.aicpu_pct.to_string()).unwrap_or("-".into()),
+                usage
+                    .map(|u| u.ctrlcpu_pct.to_string())
+                    .unwrap_or("-".into()),
+                usage
+                    .map(|u| u.hbm_bw_pct.to_string())
+                    .unwrap_or("-".into()),
+                app.npu
+                    .ecc
+                    .get(&card.index)
+                    .map(|e| format!(
+                        "sb {}  db {}  iso {}",
+                        e.single_bit, e.double_bit, e.isolated_pages
+                    ))
+                    .unwrap_or_else(|| "-".to_string()),
+            )));
+            lines.push(Line::from(match common {
+                Some(common) => format!(
+                    " Freq {}/{} MHz  {} cores{}",
+                    common.aicore_cur_freq_mhz,
+                    common.aicore_freq_mhz,
+                    common.aicore_count,
+                    common
+                        .mcu_temp_c
+                        .map(|t| format!("  MCU {:.0}C", t))
+                        .unwrap_or_default(),
+                ),
+                None => " Freq / cores: not sampled".to_string(),
+            }));
+        }
+        None => lines.push(Line::from(
+            " AIVector / AICPU / HBM BW / ECC / Freq: sampling...",
+        )),
+    }
+    lines
+}
+
+/// Selected-process details: name truncation from `npu-smi` is undone by
+/// the `/proc` cmdline; container attribution answers "whose job is this".
+fn npu_proc_lines(row: &NpuProcRow) -> Vec<Line<'static>> {
+    // `npu-smi` lists the host pid; inside a namespaced container the
+    // resolvable one is the container pid reported by 26.x.
+    let pid_label = match row
+        .extra
+        .as_ref()
+        .filter(|extra| extra.via_container_pid)
+        .and_then(|extra| extra.local_pid)
+    {
+        Some(local) => format!(" PID {} → {}  ", row.pid, local),
+        None => format!(" PID {}  ", row.pid),
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            pid_label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(row.name.clone()),
+        Span::raw(format!(
+            "  cards {}  HBM {} MB",
+            row.cards_label(),
+            row.hbm_mb
+        )),
+    ])];
+    match &row.extra {
+        Some(extra) if !extra.visible => lines.push(Line::from(
+            " host-side process — no /proc entry in this namespace".to_string(),
+        )),
+        Some(extra) => {
+            lines.push(Line::from(format!(
+                " user {}  container {}  RSS {} MB",
+                extra.user.as_deref().unwrap_or("-"),
+                extra.ctn_label(),
+                extra.rss_mb.map(|v| v.to_string()).unwrap_or("-".into()),
+            )));
+            lines.push(Line::from(format!(
+                " cmd {}",
+                extra.cmdline.as_deref().unwrap_or("-")
+            )));
+        }
+        None => lines.push(Line::from(" enriching /proc data...".to_string())),
+    }
+    lines
+}
+
 fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let header = Row::new(["PID", "NAME", "NPU", "HBM(MB)"]).style(
+    let header = Row::new(["PID", "NAME", "NPU", "CTN", "HBM(MB)"]).style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     );
     let rows = app.npu_procs.iter().map(|row| {
+        let ctn = row
+            .extra
+            .as_ref()
+            .map(|extra| extra.ctn_label().chars().take(10).collect::<String>())
+            .unwrap_or_else(|| "-".to_string());
         Row::new(vec![
             Cell::from(row.pid.to_string()),
             Cell::from(row.name.clone()),
             Cell::from(row.cards_label()),
+            Cell::from(ctn),
             Cell::from(format!("{:>10}", row.hbm_mb)),
         ])
     });
@@ -539,6 +691,7 @@ fn draw_npu_procs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Min(20),
         Constraint::Length(8),
+        Constraint::Length(11),
         Constraint::Length(12),
     ];
     let mut state = TableState::default();

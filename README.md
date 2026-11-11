@@ -32,9 +32,26 @@ A lightweight terminal process monitor written in Rust, based on ratatui and sys
 When `npu-smi` is available, utop opens on the NPU screen:
 
 - Per-card health, temperature, power, AI Core utilisation and HBM usage
-- Chip details: PCIe bus id, HBM used/total, hugepages
+- Chip details: PCIe bus id, HBM used/total, hugepages — plus, for the
+  selected card, `npu-smi -t` detail: AIVector/AICPU/Ctrlcpu rates, HBM
+  bandwidth, AI Core frequency, core count, MCU temperature
+- ECC counters swept one card per round; a `NOTE` column flags `ECC!`
+  (uncorrectable/isolated pages), `ecc` (correctable), `idle` (HBM nearly
+  full with the AI Core idle for ~5 minutes — the dead-worker signature)
+  and `masked` (outside `ASCEND_RT_VISIBLE_DEVICES`, which is echoed in
+  the header when set)
 - NPU process table aggregated by PID: a process spanning several cards
-  appears once, with every card id listed
+  appears once, with every card id listed. A `CTN` column attributes each
+  process to a container (via `/proc/<pid>/cgroup`, with `docker ps`
+  names when docker is reachable) or `host`; `?` marks a PID that is not
+  visible in the current PID namespace, and `local` marks a process
+  resolved through its in-container PID — i.e. one that shares our
+  container (`npu-smi` 26.x reports that column; older tools only offer
+  the host PID, so a namespaced container degrades to `?`)
+- The middle pane follows focus: card metrics on the card table, and the
+  selected process's full command line / user / RSS on the process table
+  (`npu-smi` truncates names at ~15 chars — `VLLMEngineCor` gets its
+  command line back)
 - `F2` switches between the NPU and system views; `Tab` moves focus
   between the card table and the process table
 
@@ -42,6 +59,9 @@ One limit is worth stating up front: `npu-smi` and DCMI expose **card-level**
 AI Core utilisation and **process-level** HBM usage, but not per-process
 compute usage. The `NPU` column in the process table therefore describes
 reserved HBM and card placement, not a per-process utilisation percentage.
+A second limit: in containers created for *computing-power allocation*
+(vNPU), the usage counters report 0 — an artefact of the allocation, not
+of the workload.
 
 For scripts and CI:
 
@@ -50,8 +70,10 @@ utop --once          # one text sample
 utop --once --json   # one JSON sample
 ```
 
-The NPU collector runs on a background thread with a deadline on every
-`npu-smi` call, so a slow or hung driver cannot freeze the TUI.
+Each sample round costs four `npu-smi` calls (`info`, `usages` and
+`common` for the selected card, one `ecc` card) plus `/proc` enrichment
+and a cached `docker ps` — all on a background thread with a deadline on
+every call, so a slow or hung driver cannot freeze the TUI.
 
 ## Build & Run
 
@@ -117,9 +139,10 @@ Note: when filtering, the tree view is temporarily flattened into a list, becaus
 | `src/collect.rs` | sysinfo snapshots (the only module that touches sysinfo) |
 | `src/ui.rs` | ratatui rendering (pure rendering, reads only the snapshot in App) |
 | `src/cli.rs` | Command-line argument parsing (pure parser) |
-| `src/npu/model.rs` | NPU card / process model, aggregation (pure) |
-| `src/npu/smi.rs` | `npu-smi` invocation and text parsing (only subprocess site) |
-| `src/npu/collect.rs` | Background collector thread with latest-wins delivery |
+| `src/npu/model.rs` | NPU card / process model, aggregation, card flags (pure) |
+| `src/npu/smi.rs` | `npu-smi` invocation and text parsing (only `npu-smi` site) |
+| `src/npu/procfs.rs` | `/proc` enrichment and container attribution |
+| `src/npu/collect.rs` | Sampling orchestration and latest-wins collector thread |
 
 The layering is strictly acyclic: `model` ← `cli` ← `app` ← {`collect`, `ui`} ← `run`. Everything except `run` and `collect` is pure logic, so unit tests need no real system.
 
@@ -170,13 +193,28 @@ Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), and 
 检测到 `npu-smi` 时，utop 默认进入 NPU 视图：
 
 - 逐卡显示健康状态、温度、功耗、AI Core 利用率与 HBM 占用
-- 芯片详情：PCIe 总线号、HBM 已用/总量、大页使用
-- NPU 进程表按 PID 聚合：跨多卡的进程只出现一次，NPU 列列出全部卡号
+- 芯片详情：PCIe 总线号、HBM 已用/总量、大页使用；选中卡另有
+  `npu-smi -t` 详情：AIVector/AICPU/Ctrlcpu 利用率、HBM 带宽、
+  AI Core 频率、核数、MCU 温度
+- ECC 计数每轮扫一张卡；`NOTE` 列给出标记：`ECC!`（不可纠正错误/
+  隔离页）、`ecc`（可纠正错误）、`idle`（HBM 接近占满且 AI Core 连续
+  约 5 分钟空闲——僵尸占卡的典型特征）、`masked`（不在
+  `ASCEND_RT_VISIBLE_DEVICES` 内，头部同时回显该变量）
+- NPU 进程表按 PID 聚合：跨多卡的进程只出现一次，NPU 列列出全部卡号。
+  `CTN` 列给出容器归属（读 `/proc/<pid>/cgroup`，docker 可达时映射
+  容器名）或 `host`；`?` 表示 PID 在当前命名空间不可见；`local` 表示
+  进程通过其容器内 PID 解析成功——即与 utop 同容器（`npu-smi` 26.x
+  新增的容器内 PID 列使这条路径可用；更早版本只有宿主 PID，普通
+  容器内只能降级为 `?`）
+- 中间面板随焦点切换：卡表焦点显示卡指标，进程表焦点显示选中进程的
+  完整命令行 / 用户 / RSS（`npu-smi` 约 15 字符的截断名被补全——
+  `VLLMEngineCor` 能看清是谁了）
 - `F2` 在 NPU 视图与系统视图之间切换；`Tab` 在卡表与进程表之间切换焦点
 
 有一个边界需要提前说明：`npu-smi` 和 DCMI 提供**卡级** AI Core 利用率与
 **进程级** HBM 占用，但不提供进程级算力利用率。因此进程表的 `NPU` 列表示
-显存占用与卡归属，而不是单进程利用率。
+显存占用与卡归属，而不是单进程利用率。另一个边界：在算力切分（vNPU）
+容器内，利用率计数器恒为 0——那是切分方式的产物，不代表负载情况。
 
 脚本与 CI 用法：
 
@@ -185,8 +223,9 @@ utop --once          # 输出一次文本采样
 utop --once --json   # 输出一次 JSON 采样
 ```
 
-NPU 采集运行在后台线程，每次 `npu-smi` 调用都有超时；驱动变慢或卡死不会
-冻结 TUI。
+每轮采样固定四个 `npu-smi` 调用（`info`、选中卡的 `usages` 与 `common`、
+一张卡的 `ecc`），加上 `/proc` 增强与有缓存的 `docker ps`，全部运行在
+后台线程且每次调用都有超时；驱动变慢或卡死不会冻结 TUI。
 
 ## 构建与运行
 
@@ -252,9 +291,10 @@ utop [选项]
 | `src/collect.rs` | sysinfo 快照（唯一碰 sysinfo 的模块） |
 | `src/ui.rs` | ratatui 渲染（纯渲染，只读 App 中的快照） |
 | `src/cli.rs` | 命令行参数解析（纯解析器） |
-| `src/npu/model.rs` | NPU 卡 / 进程模型与聚合（纯逻辑） |
-| `src/npu/smi.rs` | `npu-smi` 调用与文本解析（唯一子进程入口） |
-| `src/npu/collect.rs` | 后台采集线程，latest-wins 投递 |
+| `src/npu/model.rs` | NPU 卡 / 进程模型、聚合与卡标记（纯逻辑） |
+| `src/npu/smi.rs` | `npu-smi` 调用与文本解析（唯一 npu-smi 入口） |
+| `src/npu/procfs.rs` | `/proc` 进程增强与容器归属 |
+| `src/npu/collect.rs` | 采样编排与 latest-wins 后台采集线程 |
 
 分层严格无环：`model` ← `cli` ← `app` ← {`collect`, `ui`} ← `run`。除 `run` 与 `collect` 外全部是纯逻辑，单元测试无需真实系统。
 

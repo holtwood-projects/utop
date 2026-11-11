@@ -7,13 +7,15 @@
 //! event loop performs that work and stores fresh snapshots back into `App`.
 //! State never changes behind `App`'s back.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::cli::{Config, MAX_DELAY_MS, MIN_DELAY_MS};
 use crate::model::{
     Pid, ProcDetails, ProcRow, SignalKind, SortKey, SysStats, resolve_selected_index, sort_rows,
 };
-use crate::npu::model::{NpuCard, NpuProcRow, NpuSnapshot, filter_proc_rows, sort_proc_rows};
+use crate::npu::model::{
+    NpuCard, NpuProcRow, NpuSnapshot, filter_proc_rows, sort_proc_rows, update_idle_streaks,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputMode {
@@ -104,6 +106,10 @@ pub(crate) struct App {
     pub(crate) npu_focus: NpuFocus,
     /// HBM sort direction for the NPU process pane.
     pub(crate) npu_desc: bool,
+    /// `ASCEND_RT_VISIBLE_DEVICES` card set; `None` means all visible.
+    pub(crate) npu_visible: Option<Vec<u32>>,
+    /// Consecutive hot-but-idle samples per card (`model::update_idle_streaks`).
+    pub(crate) npu_idle: HashMap<u32, u32>,
 }
 
 impl App {
@@ -135,6 +141,8 @@ impl App {
             npu_selected: 0,
             npu_focus: NpuFocus::Cards,
             npu_desc: true,
+            npu_visible: None,
+            npu_idle: HashMap::new(),
         }
     }
 
@@ -302,6 +310,7 @@ impl App {
             return;
         }
         self.npu = snapshot;
+        update_idle_streaks(&mut self.npu_idle, &self.npu.cards);
         self.npu_all_procs = self.npu.aggregate_processes();
         sort_proc_rows(&mut self.npu_all_procs, self.npu_desc);
         self.reshape_npu_procs();

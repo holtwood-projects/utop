@@ -7,6 +7,8 @@
 
 use std::error::Error;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -24,7 +26,7 @@ use crate::app::{App, Followup, InputMode, View};
 use crate::cli::Config;
 use crate::collect::{self, KillOutcome, System};
 use crate::model::{SignalKind, build_tree, resolve_selected_index, selected_pid};
-use crate::npu::collect::NpuFeed;
+use crate::npu::collect::{NO_CARD, NpuFeed};
 use crate::ui::ui;
 
 /// Lines moved per mouse-wheel scroll tick.
@@ -49,9 +51,17 @@ pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     install_panic_hook();
     let mut sys = collect::init_system();
     // One probe before taking over the terminal: it decides the initial
-    // view and keeps the no-NPU case on the original process screen.
-    let npu_feed = crate::npu::smi::available()
-        .then(|| NpuFeed::spawn(Duration::from_millis(config.delay_ms.max(1000))));
+    // view and keeps the no-NPU case on the original process screen. The
+    // shared `selected` slot lets the UI tell the collector which card to
+    // run `npu-smi -t` detail queries on.
+    let npu_selected = Arc::new(AtomicU32::new(NO_CARD));
+    let npu_feed = crate::npu::smi::available().then(|| {
+        let feed = NpuFeed::spawn(
+            Duration::from_millis(config.delay_ms.max(1000)),
+            Arc::clone(&npu_selected),
+        );
+        (feed, npu_selected)
+    });
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -98,11 +108,16 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &Config,
     sys: &mut System,
-    npu_feed: Option<NpuFeed>,
+    npu_feed: Option<(NpuFeed, Arc<AtomicU32>)>,
 ) -> Result<(), Box<dyn Error>> {
     let mut app = App::new(config);
     if npu_feed.is_some() {
         app.view = View::Npu;
+        // `npu-smi` always lists every card; the env only decides which
+        // ones an Ascend app can actually use.
+        app.npu_visible = crate::npu::model::parse_visible_env(
+            std::env::var("ASCEND_RT_VISIBLE_DEVICES").ok().as_deref(),
+        );
     } else {
         app.set_status("npu-smi not found; showing system view".to_string());
     }
@@ -115,10 +130,20 @@ fn event_loop(
         // NPU samples arrive asynchronously; drain them every frame so a
         // slow tick rate does not delay the whole screen.
         if !app.paused
-            && let Some(feed) = &npu_feed
+            && let Some((feed, _)) = &npu_feed
             && let Some(snapshot) = feed.poll()
         {
             app.apply_npu(snapshot);
+        }
+        // Publish the selected card so the collector's `-t` detail calls
+        // track what the user is looking at.
+        if let Some((_, selected)) = &npu_feed {
+            selected.store(
+                app.selected_card()
+                    .map(|card| card.index)
+                    .unwrap_or(NO_CARD),
+                Ordering::Relaxed,
+            );
         }
 
         let tick_rate = Duration::from_millis(app.tick_rate_ms);
@@ -211,7 +236,22 @@ fn settle(sys: &mut System, app: &mut App) {
                 app.set_status(format!("{} unsupported on this platform", kind.name()));
             }
             KillOutcome::Gone => {
-                app.set_status(format!("PID {} no longer exists", pid.as_u32()));
+                // On the NPU view the PID may be host-side and simply
+                // invisible in this container's PID namespace.
+                let host_side = app
+                    .npu_procs
+                    .iter()
+                    .find(|row| row.pid == pid.as_u32())
+                    .and_then(|row| row.extra.as_ref())
+                    .is_some_and(|extra| !extra.visible);
+                if host_side {
+                    app.set_status(format!(
+                        "PID {} is host-side; not reachable from this namespace",
+                        pid.as_u32()
+                    ));
+                } else {
+                    app.set_status(format!("PID {} no longer exists", pid.as_u32()));
+                }
             }
         }
     }

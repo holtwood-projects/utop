@@ -12,9 +12,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-card health, temperature, power, AI Core utilisation and HBM usage,
   plus the NPU process table aggregated by PID. `Tab` switches focus
   between the card table and the process table.
-- `--once` / `--json` for scriptable one-shot NPU samples.
+- Per-card `npu-smi -t` detail for the *selected* card — AIVector / AICPU /
+  Ctrlcpu rates, HBM bandwidth, AI Core frequency, core count and MCU
+  temperature — filling the metrics pane that previously said
+  "not sampled yet".
+- ECC counters swept one card per round, and a `NOTE` column on the card
+  table: `ECC!` (double-bit errors or isolated pages), `ecc` (single-bit),
+  `idle` (HBM ≥ 85 % with AI Core ≤ 2 % for ~5 minutes — the dead-worker
+  signature) and `masked` (outside `ASCEND_RT_VISIBLE_DEVICES`, echoed in
+  the header when set).
+- `/proc` enrichment for NPU processes: full command line, user, RSS and
+  container attribution from the cgroup path, with `docker ps` names when
+  docker is reachable (2 s deadline, 30 s cache). A `CTN` column shows the
+  container, `host`, or `?` for a PID that has no `/proc` entry in the
+  current PID namespace. `npu-smi` 26.x adds a `Process id in container`
+  column; when a host PID is invisible but the container PID resolves —
+  i.e. the process shares our container — enrichment still works and the
+  column reads `local`.
+- The middle NPU pane follows focus: card metrics while navigating cards,
+  selected-process details (command line, user, container, RSS) while
+  navigating processes.
+- `--once` text output gains a `CTN` column; `--json` process objects gain
+  `container_pid`, `visible`, `user`, `container` and `cmdline` fields.
+- `npu/procfs`: the only module that reads `/proc`; injectable roots keep
+  the parsers unit-testable.
 - Fixture-based parser tests (`tests/fixtures/`, `tests/npu_parse.rs`), so
-  the text layer is covered on CI machines without an NPU.
+  the text layer is covered on CI machines without an NPU. Captured
+  samples cover `npu-smi` 24.1, 25.2 and 26.1 (`910B1`), including the
+  26.x in-container PID column.
 - `npu` module: pure card/process model, `npu-smi` parser with a deadline
   on every subprocess, and a latest-wins collector thread.
 - Crate is now a library plus a thin binary, so integration tests can link
@@ -22,8 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- One NPU sampling round is now orchestrated by `NpuCollector`: `info`
+  plus `usages`/`common` for the selected card, one `ecc` card and
+  process enrichment — four `npu-smi` calls per round plus a `docker ps`
+  every 30 s, all on the collector thread.
+- `UsageSample` / `CommonSample` / `EccSample` moved into `npu::model`
+  (pure data belongs to the pure layer); `npu::smi` re-exports them so
+  existing paths keep working.
 - The default view is the NPU screen when `npu-smi` is present; without it
   utop falls back to the original system view.
+- Killing a host-side PID from inside a container reports "not reachable
+  from this namespace" instead of the misleading "no longer exists".
 - The module boundary is now real instead of aspirational: `collect` is
   literally the only module that imports sysinfo. The UI reads snapshot
   structs (`SysStats` / `ProcDetails`) stored on `App`, the event loop

@@ -6,18 +6,21 @@
 //! |----------|-------------------------------------------------|
 //! | `model`  | pure data types, aggregation, sorting/filtering |
 //! | `smi`    | `npu-smi` invocation and text parsing           |
+//! | `procfs` | `/proc` enrichment and container attribution    |
 //! | `report` | one-shot `--once` output                        |
 //!
-//! Only `smi` spawns a subprocess; everything else is pure.
+//! `smi` spawns `npu-smi`; `procfs` reads `/proc` and spawns `docker ps`;
+//! everything else is pure.
 
 pub mod collect;
 pub mod model;
+pub mod procfs;
 pub mod report;
 pub mod smi;
 
-pub use collect::NpuFeed;
+pub use collect::{NO_CARD, NpuCollector, NpuFeed};
 pub use model::{
-    Health, NpuCard, NpuProcRow, NpuProcess, NpuSnapshot, aggregate_processes, filter_proc_rows,
-    sort_proc_rows,
+    CardFlag, Health, NpuCard, NpuProcRow, NpuProcess, NpuSnapshot, ProcExtra, aggregate_processes,
+    card_flag, filter_proc_rows, sort_proc_rows,
 };
 pub use smi::{SmiError, collect};

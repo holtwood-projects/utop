@@ -4,7 +4,7 @@
 //! read them. Keeping the model pure is what lets the parsers be tested
 //! against fixtures without a live NPU.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 /// Chip health as reported by `npu-smi`.
@@ -85,9 +85,61 @@ impl NpuCard {
 pub struct NpuProcess {
     pub card: u32,
     pub chip: u32,
+    /// Host-side PID, as `npu-smi` always reports it.
     pub pid: u32,
+    /// The PID inside the process's own container, reported by `npu-smi`
+    /// 26.x (`Process id in container` column); `None` on older tools.
+    /// It resolves `/proc` only in that container's namespace — i.e. it
+    /// works exactly when utop runs inside the same container.
+    pub container_pid: Option<u32>,
     pub name: String,
     pub hbm_mb: u64,
+}
+
+/// Host-side facts about one NPU process, read from `/proc` by `procfs`.
+///
+/// `npu-smi` reports the *host* PID; inside a container without
+/// `--pid=host` that PID has no `/proc` entry. On `npu-smi` 26.x the
+/// process's *container* PID offers a second lookup path: it resolves
+/// exactly when utop runs inside the same container (`via_container_pid`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcExtra {
+    /// The PID resolves in the current PID namespace.
+    pub visible: bool,
+    /// The PID `/proc` was actually read from — the host PID on the host,
+    /// or the container PID inside the process's own container.
+    pub local_pid: Option<u32>,
+    /// Set when `local_pid` is the *container* PID: enrichment succeeded
+    /// because utop runs inside the same container as the process.
+    pub via_container_pid: bool,
+    /// Login name, or the numeric uid as a string when unresolvable.
+    pub user: Option<String>,
+    /// Resident host memory in MiB.
+    pub rss_mb: Option<u64>,
+    /// Full command line (`npu-smi` truncates the name at ~15 chars).
+    pub cmdline: Option<String>,
+    /// Container runtime id extracted from the cgroup path.
+    pub container_id: Option<String>,
+    /// Container name (docker) or the short id when only the id is known.
+    pub container: Option<String>,
+}
+
+impl ProcExtra {
+    /// Short label for the process-table CTN column.
+    pub fn ctn_label(&self) -> &str {
+        if let Some(container) = &self.container {
+            container
+        } else if !self.visible {
+            "?"
+        } else if self.via_container_pid {
+            // `/proc` was reached through the container PID, so the
+            // process lives in *this* container even when its cgroup
+            // carries no runtime id (containers hide the host path).
+            "local"
+        } else {
+            "host"
+        }
+    }
 }
 
 /// A process aggregated across every card it occupies.
@@ -97,6 +149,8 @@ pub struct NpuProcRow {
     pub name: String,
     pub cards: Vec<u32>,
     pub hbm_mb: u64,
+    /// `/proc` enrichment; `None` when enrichment has not run.
+    pub extra: Option<ProcExtra>,
 }
 
 impl NpuProcRow {
@@ -109,6 +163,50 @@ impl NpuProcRow {
     }
 }
 
+/// Parses `npu-smi info -t usages -i N` output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageSample {
+    pub hbm_capacity_mb: u64,
+    pub hbm_usage_pct: f32,
+    pub aicore_pct: f32,
+    pub aivector_pct: f32,
+    pub aicpu_pct: f32,
+    pub ctrlcpu_pct: f32,
+    pub hbm_bw_pct: f32,
+}
+
+/// Parses `npu-smi info -t common -i N` output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CommonSample {
+    pub aicore_freq_mhz: u32,
+    pub aicore_cur_freq_mhz: u32,
+    pub aicore_count: u32,
+    pub temp_c: f32,
+    pub power_w: f32,
+    pub mcu_temp_c: Option<f32>,
+}
+
+/// Parses `npu-smi info -t ecc -i N` output, summed over every reported
+/// HBM block.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EccSample {
+    pub single_bit: u64,
+    pub double_bit: u64,
+    pub isolated_pages: u64,
+}
+
+/// Deeper metrics for one card, sampled on demand by `collect` for the
+/// card the user is looking at (`npu-smi info -t` is one subprocess call
+/// per query, so sampling every card every round would be too heavy).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CardDetail {
+    /// Card index (`npu-smi -i`) the sample belongs to; the UI ignores a
+    /// detail whose card no longer matches the selection.
+    pub card: u32,
+    pub usage: Option<UsageSample>,
+    pub common: Option<CommonSample>,
+}
+
 /// Everything one sampling round produced. Plain data, cloned across the
 /// collector/UI boundary.
 #[derive(Clone, Debug, Default)]
@@ -118,6 +216,13 @@ pub struct NpuSnapshot {
     pub collected_at: Option<Instant>,
     pub cards: Vec<NpuCard>,
     pub processes: Vec<NpuProcess>,
+    /// Detail sample for the card selected when the round started.
+    pub detail: Option<CardDetail>,
+    /// Latest ECC counters per card, accumulated round-robin by the
+    /// collector (one card per round keeps the subprocess count bounded).
+    pub ecc: HashMap<u32, EccSample>,
+    /// `/proc` enrichment per NPU PID; empty map until enrichment ran.
+    pub extras: HashMap<u32, ProcExtra>,
     /// Set when collection failed; the previous cards are kept by the UI so
     /// a transient failure does not blank the screen.
     pub error: Option<String>,
@@ -136,7 +241,11 @@ impl NpuSnapshot {
     }
 
     pub fn aggregate_processes(&self) -> Vec<NpuProcRow> {
-        aggregate_processes(&self.processes)
+        let mut rows = aggregate_processes(&self.processes);
+        for row in &mut rows {
+            row.extra = self.extras.get(&row.pid).cloned();
+        }
+        rows
     }
 }
 
@@ -149,6 +258,7 @@ pub fn aggregate_processes(procs: &[NpuProcess]) -> Vec<NpuProcRow> {
             name: proc.name.clone(),
             cards: Vec::new(),
             hbm_mb: 0,
+            extra: None,
         });
         if !row.cards.contains(&proc.card) {
             row.cards.push(proc.card);
@@ -193,6 +303,95 @@ pub fn hbm_pct(used: u64, total: u64) -> f64 {
     }
 }
 
+/// Parses `ASCEND_RT_VISIBLE_DEVICES` into the set of card indexes an
+/// Ascend app would see. `npu-smi` always lists every card, so the env is
+/// display context only: `None` (unset) means every card is visible, while
+/// an explicitly empty value masks them all.
+pub fn parse_visible_env(value: Option<&str>) -> Option<Vec<u32>> {
+    let value = value?;
+    Some(
+        value
+            .split(',')
+            .filter_map(|token| token.trim().parse().ok())
+            .collect(),
+    )
+}
+
+/// A card is "hot but idle" once its HBM is nearly full while the AI Core
+/// sits still — the signature of a dead worker still holding its memory.
+pub const IDLE_HBM_PCT: f64 = 85.0;
+/// AI Core readings at or below this count as idle.
+pub const IDLE_AICORE_PCT: f32 = 2.0;
+/// Consecutive hot-but-idle samples before the card is flagged. The
+/// collector runs about once a second, so this is roughly five minutes —
+/// long enough not to cry wolf on a legitimately idle loaded engine.
+pub const IDLE_ROUNDS: u32 = 300;
+
+/// Advances the per-card hot-but-idle streaks from one snapshot's cards.
+/// Streaks for cards that left the table are dropped.
+pub fn update_idle_streaks(streaks: &mut HashMap<u32, u32>, cards: &[NpuCard]) {
+    let alive: Vec<u32> = cards.iter().map(|c| c.index).collect();
+    streaks.retain(|card, _| alive.contains(card));
+    for card in cards {
+        if card.hbm_pct() >= IDLE_HBM_PCT && card.aicore_pct <= IDLE_AICORE_PCT {
+            *streaks.entry(card.index).or_insert(0) += 1;
+        } else {
+            streaks.remove(&card.index);
+        }
+    }
+}
+
+/// One-line badge on a card row; at most one shows at a time, ordered by
+/// severity so a sick card is never hidden behind an idle note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardFlag {
+    /// Uncorrectable ECC errors or isolated HBM pages — check the hardware.
+    EccAlarm,
+    /// Correctable single-bit ECC errors observed.
+    EccWarn,
+    /// HBM nearly full with the AI Core idle for `IDLE_ROUNDS` samples.
+    Idle,
+    /// Not in `ASCEND_RT_VISIBLE_DEVICES`; invisible to NPU apps.
+    Masked,
+}
+
+impl CardFlag {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EccAlarm => "ECC!",
+            Self::EccWarn => "ecc",
+            Self::Idle => "idle",
+            Self::Masked => "masked",
+        }
+    }
+}
+
+/// Picks the badge for one card row, by severity.
+pub fn card_flag(
+    card: &NpuCard,
+    ecc: Option<&EccSample>,
+    idle_streak: u32,
+    visible: Option<&[u32]>,
+) -> Option<CardFlag> {
+    if let Some(ecc) = ecc {
+        if ecc.double_bit > 0 || ecc.isolated_pages > 0 {
+            return Some(CardFlag::EccAlarm);
+        }
+        if ecc.single_bit > 0 {
+            return Some(CardFlag::EccWarn);
+        }
+    }
+    if idle_streak >= IDLE_ROUNDS {
+        return Some(CardFlag::Idle);
+    }
+    if let Some(visible) = visible
+        && !visible.contains(&card.index)
+    {
+        return Some(CardFlag::Masked);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +401,7 @@ mod tests {
             card,
             chip: 0,
             pid,
+            container_pid: None,
             name: name.to_string(),
             hbm_mb,
         }
@@ -286,5 +486,123 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(card.hbm_pct(), 25.0);
+    }
+
+    #[test]
+    fn parse_visible_env_distinguishes_unset_empty_and_list() {
+        assert_eq!(parse_visible_env(None), None);
+        assert_eq!(parse_visible_env(Some("")), Some(vec![]));
+        assert_eq!(parse_visible_env(Some("0,2,3")), Some(vec![0, 2, 3]));
+        // Whitespace tolerated, junk tokens skipped.
+        assert_eq!(parse_visible_env(Some(" 4 , x ,7")), Some(vec![4, 7]));
+    }
+
+    fn hot_idle_card(index: u32) -> NpuCard {
+        NpuCard {
+            index,
+            aicore_pct: 0.0,
+            hbm_used_mb: 60_000,
+            hbm_total_mb: 65_536,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_streak_counts_hot_idle_cards_and_resets() {
+        let mut streaks = HashMap::new();
+        update_idle_streaks(&mut streaks, &[hot_idle_card(3)]);
+        update_idle_streaks(&mut streaks, &[hot_idle_card(3)]);
+        assert_eq!(streaks[&3], 2);
+        // Card back under load: streak clears.
+        let mut busy = hot_idle_card(3);
+        busy.aicore_pct = 50.0;
+        update_idle_streaks(&mut streaks, &[busy]);
+        assert!(!streaks.contains_key(&3));
+        // Card vanished from the table: entry dropped.
+        update_idle_streaks(&mut streaks, &[hot_idle_card(3)]);
+        update_idle_streaks(&mut streaks, &[]);
+        assert!(streaks.is_empty());
+    }
+
+    #[test]
+    fn card_flag_prioritises_ecc_over_idle_over_masked() {
+        let card = hot_idle_card(7);
+        let ecc = EccSample {
+            single_bit: 0,
+            double_bit: 2,
+            isolated_pages: 0,
+        };
+        assert_eq!(
+            card_flag(&card, Some(&ecc), IDLE_ROUNDS, Some(&[0])),
+            Some(CardFlag::EccAlarm)
+        );
+        let ecc = EccSample {
+            single_bit: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            card_flag(&card, Some(&ecc), IDLE_ROUNDS, None),
+            Some(CardFlag::EccWarn)
+        );
+        assert_eq!(
+            card_flag(&card, None, IDLE_ROUNDS, Some(&[7])),
+            Some(CardFlag::Idle)
+        );
+        assert_eq!(
+            card_flag(&card, None, 0, Some(&[0, 1])),
+            Some(CardFlag::Masked)
+        );
+        assert_eq!(card_flag(&card, None, 0, Some(&[7])), None);
+        assert_eq!(card_flag(&card, None, 0, None), None);
+    }
+
+    #[test]
+    fn aggregate_processes_method_attaches_extras() {
+        let mut snapshot = NpuSnapshot {
+            processes: vec![proc_(7, 22128, "VLLMEngineCor", 54256)],
+            ..Default::default()
+        };
+        snapshot.extras.insert(
+            22128,
+            ProcExtra {
+                visible: true,
+                container: Some("pytorch".into()),
+                ..Default::default()
+            },
+        );
+        let rows = snapshot.aggregate_processes();
+        assert_eq!(
+            rows[0].extra.as_ref().and_then(|e| e.container.as_deref()),
+            Some("pytorch")
+        );
+        // Free function keeps no extras (public API unchanged).
+        let rows = aggregate_processes(&snapshot.processes);
+        assert!(rows[0].extra.is_none());
+    }
+
+    #[test]
+    fn ctn_label_prefers_container_then_marks_invisible_then_host() {
+        let extra = ProcExtra {
+            visible: true,
+            container: Some("mindie".into()),
+            ..Default::default()
+        };
+        assert_eq!(extra.ctn_label(), "mindie");
+        let extra = ProcExtra {
+            visible: false,
+            ..Default::default()
+        };
+        assert_eq!(extra.ctn_label(), "?");
+        let extra = ProcExtra {
+            visible: true,
+            ..Default::default()
+        };
+        assert_eq!(extra.ctn_label(), "host");
+        let extra = ProcExtra {
+            visible: true,
+            via_container_pid: true,
+            ..Default::default()
+        };
+        assert_eq!(extra.ctn_label(), "local");
     }
 }
